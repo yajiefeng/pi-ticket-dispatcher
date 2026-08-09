@@ -426,3 +426,38 @@ test("merge conflict asks the human via waiting_human", async () => {
   assert.ok(eventTypes(r).includes("waiting_human"));
   assert.equal(r.runStatus, "waiting_human");
 });
+
+test("resume migrates legacy (pre-interactive) state", async () => {
+  const repo = makeGitRepo();
+  const herdr = new FakeHerdr();
+  await run({ action: "start", targetRepo: repo, ticketsSource: TICKETS_SOURCE }, herdr);
+
+  // Rewrite state.json to look like the old schema: no `round`, stale worker
+  // records, a pending ticket missing round.
+  const statePath = path.join(repo, ".pi-ticket-dispatcher", "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  delete state.tickets["TKT-001"].round;
+  state.tickets["TKT-001"].status = "implementing";
+  state.tickets["TKT-001"].implementer = {
+    paneId: "p9",
+    agentName: "ticket-tkt-001-impl-1",
+    workspace: "w9",
+    worktreePath: "/nowhere",
+    branchName: "ticket/tkt-001-greet",
+    startedAt: 1,
+    status: "working",
+  };
+  fs.writeFileSync(statePath, JSON.stringify(state), "utf-8");
+
+  const r = await run({ action: "resume", targetRepo: repo }, herdr);
+  assert.equal(r.action, "resume");
+  // Migration ran: stale worker cleared, round seeded.
+  const migrated = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  assert.equal(migrated.tickets["TKT-001"].round, 0);
+  assert.equal(migrated.tickets["TKT-001"].implementer, undefined);
+  assert.equal(migrated.tickets["TKT-001"].status, "implementing");
+
+  // advance relaunches with the interactive model.
+  const adv = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.ok(eventTypes(adv).includes("worker_started"));
+});

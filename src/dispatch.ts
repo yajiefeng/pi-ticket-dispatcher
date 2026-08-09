@@ -999,12 +999,52 @@ export async function dispatchStart(
   );
 }
 
-/** Load an existing run from disk (clears "paused"). */
+/**
+ * Migrate state written by the pre-interactive worker model (commit before
+ * 56c3528): that schema had no per-ticket `round` and used exit-code-file
+ * workers. Returns true when anything changed.
+ */
+export function migrateLegacyState(state: DispatchState): boolean {
+  let changed = false;
+  for (const ts of Object.values(state.tickets)) {
+    const migrated = { ...ts } as TicketState & { round?: unknown };
+    if (typeof migrated.round !== "number" || Number.isNaN(migrated.round)) {
+      migrated.round = 0;
+      changed = true;
+    }
+    // Legacy worker records (exit-file model) are incompatible with the
+    // interactive model; clear them so advance relaunches with new workers.
+    // Non-terminal tickets keep their attempt counts and status.
+    if (!["integrated", "failed", "cancelled"].includes(migrated.status)) {
+      if (migrated.implementer || migrated.reviewer) {
+        migrated.implementer = undefined;
+        migrated.reviewer = undefined;
+        changed = true;
+      }
+    }
+    state.tickets[ts.ticket.id] = migrated as TicketState;
+  }
+  if (state.runStatus === "starting") {
+    state.runStatus = "running";
+    changed = true;
+  }
+  return changed;
+}
+
+/** Load an existing run from disk (clears "paused", migrates legacy state). */
 export function dispatchResume(
   input: Extract<DispatchInput, { action: "resume" }>,
   _depsIn: DispatcherDeps
 ): DispatchResult {
   const state = loadState(path.resolve(input.targetRepo));
+
+  // Migrate state written by older worker models (pre-56c3528: one-shot
+  // `pi -p` workers detected via exit-code files). The new model uses
+  // interactive pi workers with per-round markers, so stale worker records
+  // must be cleared (advance relaunches them) and the round counter seeded.
+  const migrated = migrateLegacyState(state);
+  if (migrated) saveState(state);
+
   const wasPaused = state.runStatus === "paused";
   if (wasPaused) {
     state.runStatus = "running";
@@ -1013,8 +1053,18 @@ export function dispatchResume(
   return buildResult(
     "resume",
     state,
-    [],
-    wasPaused ? "Run resumed." : `Run ${state.runId} loaded.`
+    migrated
+      ? [
+          {
+            type: "state_unchanged",
+            reason:
+              "resumed a run written by an older dispatcher: stale worker records were cleared " +
+              "(advance will relaunch workers with the interactive model); progress on integrated " +
+              "tickets and attempt counts are preserved",
+          },
+        ]
+      : [],
+    migrated ? "State migrated from the legacy worker model; call advance to continue." : undefined
   );
 }
 
