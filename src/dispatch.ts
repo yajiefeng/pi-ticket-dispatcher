@@ -92,6 +92,8 @@ const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 1_000;
 /** Max time one worker round may run before we ask the human. */
 const WORKER_TIMEOUT_MS = 20 * 60_000;
+/** Re-send a worker's instruction if it has been idle this long without the marker. */
+const REINSTRUCT_INTERVAL_MS = 90_000;
 
 export type ResolvedDeps = Required<Pick<DispatcherDeps, "now" | "sleep">> & DispatcherDeps;
 
@@ -218,6 +220,14 @@ function instructWorker(
 
   deps.herdr.sendText(worker.agentName, instruction);
   deps.herdr.sendKey(worker.paneId, "Enter");
+  // Record when the instruction was sent so reap can re-send it if it was
+  // lost (e.g. the worker was not ready when it arrived).
+  const current = state.tickets[id];
+  if (role === "reviewer") {
+    current.reviewer = current.reviewer ? { ...current.reviewer, instructionSentAt: deps.now() } : current.reviewer;
+  } else {
+    current.implementer = current.implementer ? { ...current.implementer, instructionSentAt: deps.now() } : current.implementer;
+  }
   deps.log?.(`instructed ${role} ${worker.agentName} (round ${round}, marker ${marker})`);
 }
 
@@ -265,6 +275,22 @@ function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps)
       .split("\n")
       .some((line) => line.trim() === marker);
     if (!markerSeen) {
+      // The instruction may have been lost (worker not ready when sent, or a
+      // transient herdr send failure). If the worker is idle and enough time
+      // passed since the last send, re-send it.
+      const status = deps.herdr.agentStatus(worker.agentName);
+      const lastSent = worker.instructionSentAt ?? worker.startedAt;
+      if (status !== "working" && deps.now() - lastSent > REINSTRUCT_INTERVAL_MS) {
+        instructWorker(
+          state,
+          ticket,
+          ticket.status === "reviewing" ? ("reviewer" as const) : ("implementer" as const),
+          worker,
+          deps
+        );
+        ctx.changed = true;
+        continue;
+      }
       // Still running. Timeout?
       if (deps.now() - worker.startedAt > WORKER_TIMEOUT_MS) {
         state.runStatus = "waiting_human";
@@ -728,14 +754,10 @@ async function launchWorkerFor(
   saveState(state);
 
   if (!(await waitForWorkerIdle(deps, workerInfo))) {
-    deps.log?.(`worker ${agentName} did not become idle; will retry the instruction on a later advance`);
-    ctx.events.push(
-      isReviewer
-        ? { type: "reviewer_started", ticketId: id }
-        : { type: "worker_started", ticketId: id, workerName: agentName }
+    deps.log?.(
+      `worker ${agentName} did not become idle in time; sending the instruction anyway ` +
+        "(reap will re-send it if it was lost)"
     );
-    ctx.changed = true;
-    return;
   }
   instructWorker(state, state.tickets[id], isReviewer ? "reviewer" : "implementer", workerInfo, deps);
   state.tickets[id].updatedAt = deps.now();

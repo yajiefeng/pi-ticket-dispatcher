@@ -45,6 +45,8 @@ export interface WorkerInfo {
   round?: number;
   /** The Herdr workspace this worker pane lives in, if the dispatcher created one. */
   workspaceId?: string;
+  /** When the current task instruction was last sent (for re-sending lost instructions). */
+  instructionSentAt?: number;
 }
 
 /** Attempt record for a single implementation or review attempt. */

@@ -48,6 +48,8 @@ export interface HerdrAdapter {
   readPane(paneId: string, lines?: number): string;
   /** True if the agent reports idle (started up, waiting for input). */
   waitAgentIdle(target: string, timeoutMs: number): boolean;
+  /** Current agent status ("idle" | "working" | ...) or undefined if unknown/gone. */
+  agentStatus(target: string): string | undefined;
   /** Create a dedicated workspace for a ticket's worker. */
   createWorkspace(opts: { label: string; cwd?: string }): { workspaceId: string };
   /** Close a workspace we created. Errors are swallowed. */
@@ -276,6 +278,20 @@ export const herdrAdapter: HerdrAdapter = {
       return parsed?.result?.agent?.agent_status === "idle";
     } catch {
       return false;
+    }
+  },
+
+  agentStatus(target) {
+    const r = spawnSync(herdrBin(), ["agent", "get", target], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (r.status !== 0) return undefined;
+    try {
+      const parsed = JSON.parse(r.stdout);
+      return parsed?.result?.agent?.agent_status;
+    } catch {
+      return undefined;
     }
   },
 

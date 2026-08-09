@@ -72,6 +72,11 @@ class FakeHerdr implements HerdrAdapter {
   waitAgentIdle(_target: string, _timeoutMs: number): boolean {
     return true;
   }
+  /** Configurable agent status; default idle so re-sends are testable. */
+  statuses = new Map<string, string>();
+  agentStatus(target: string): string | undefined {
+    return this.statuses.get(target) ?? "idle";
+  }
   createWorkspace(opts: { label: string; cwd?: string }) {
     const id = `w${++this.wsSeq}`;
     this.workspaces.set(id, opts.label);
@@ -460,4 +465,24 @@ test("resume migrates legacy (pre-interactive) state", async () => {
   // advance relaunches with the interactive model.
   const adv = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.ok(eventTypes(adv).includes("worker_started"));
+});
+
+test("re-sends a lost worker instruction", async () => {
+  const repo = makeGitRepo();
+  const herdr = new FakeHerdr();
+  await run({ action: "start", targetRepo: repo, ticketsSource: JSON.stringify([{ id: "X", title: "X", description: "", dependsOn: [] }]) }, herdr);
+  await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.equal(herdr.sent.length, 1);
+
+  // Simulate a lost instruction: the worker is idle, no marker ever appears,
+  // and the last send was long ago.
+  herdr.sent = [];
+  const statePath = path.join(repo, ".pi-ticket-dispatcher", "state.json");
+  const st = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  st.tickets.X.implementer.instructionSentAt = Date.now() - 200_000;
+  fs.writeFileSync(statePath, JSON.stringify(st), "utf-8");
+
+  const r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.equal(herdr.sent.length, 1, "lost instruction should be re-sent");
+  assert.ok(herdr.sent[0].text.includes("DONE-X-1"), herdr.sent[0].text);
 });
