@@ -113,7 +113,7 @@ If the Dispatcher Pi restarted mid-run:
 - Workers are interactive `pi` processes: you can watch them work (and their
   Herdr working/idle status) in the Herdr UI. Each worker round is detected by
   a unique completion marker (DONE-<ID>-<round>) the worker replies with.
-- If a worker runs longer than 20 minutes without completing, the run pauses
+- If a worker runs longer than 3 hours without completing, the run pauses
   with `waiting_human` (retry_launch / fail_ticket / cancel_run).
 - Never launch workers yourself; `advance` handles parallelism and capacity.
 - Keep calling `advance` when you see `state_unchanged` — that is the

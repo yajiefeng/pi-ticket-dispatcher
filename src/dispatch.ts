@@ -91,7 +91,7 @@ const DEFAULT_WAIT_MS = 60_000;
 const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 1_000;
 /** Max time one worker round may run before we ask the human. */
-const WORKER_TIMEOUT_MS = 20 * 60_000;
+const WORKER_TIMEOUT_MS = 3 * 60 * 60 * 1_000; // 3 hours
 /** Re-send a worker's instruction if it has been idle this long without the marker. */
 const REINSTRUCT_INTERVAL_MS = 90_000;
 

@@ -137,5 +137,5 @@ version automatically:
 
 Either way the worker is a real interactive `pi`, so Herdr reports
 `working`/`idle` and the TUI is visible. Completion is always detected by the
-round marker + git verification; a worker that runs over 20 minutes without
+round marker + git verification; a worker that runs over 3 hours without
 completing pauses the run with `waiting_human`.
