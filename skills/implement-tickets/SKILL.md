@@ -52,7 +52,8 @@ ready tickets, launches new workers up to `maxParallel`, and waits up to
 
 | Event | Meaning | What to do |
 |---|---|---|
-| `worker_started` | A worker pane was launched | keep advancing |
+| `worker_started` | A worker pane was launched (interactive pi, visible in Herdr with working/idle status) | keep advancing |
+| `worker_retrying` | A worker round failed verification (no commit / dirty tree / no verdict) and the same worker was told to fix it | keep advancing |
 | `implementation_ready` | Worker committed clean changes | keep advancing (review/integration follow) |
 | `review_completed` | Reviewer verdict in | keep advancing |
 | `ticket_integrated` | Branch merged into base, dependents unlocked | keep advancing |
@@ -109,6 +110,11 @@ If the Dispatcher Pi restarted mid-run:
 ## Rules
 
 - Only `start` once. After that, `advance` is the only way forward.
+- Workers are interactive `pi` processes: you can watch them work (and their
+  Herdr working/idle status) in the Herdr UI. Each worker round is detected by
+  a unique completion marker (DONE-<ID>-<round>) the worker replies with.
+- If a worker runs longer than 20 minutes without completing, the run pauses
+  with `waiting_human` (retry_launch / fail_ticket / cancel_run).
 - Never launch workers yourself; `advance` handles parallelism and capacity.
 - Keep calling `advance` when you see `state_unchanged` — that is the
   expected signal while workers run. Use a small `waitMs` (e.g. 60_000) so

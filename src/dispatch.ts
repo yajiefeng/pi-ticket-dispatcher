@@ -47,14 +47,12 @@ import {
   activeWorker,
   buildImplementerPrompt,
   buildReviewerPrompt,
-  buildWorkerScript,
-  exitFile,
-  logFile,
+  buildTaskInstruction,
   parseVerdict,
   promptFile,
   readIfExists,
+  roundMarker,
   sanitizeId,
-  tailFile,
   ticketWorkDir,
   verdictFile,
   workerAgentName,
@@ -92,6 +90,8 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_WAIT_MS = 60_000;
 const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 1_000;
+/** Max time one worker round may run before we ask the human. */
+const WORKER_TIMEOUT_MS = 20 * 60_000;
 
 export type ResolvedDeps = Required<Pick<DispatcherDeps, "now" | "sleep">> & DispatcherDeps;
 
@@ -171,42 +171,74 @@ interface ReapContext {
   only?: string[];
 }
 
-function failOrRetryImplementer(
+// ---------------------------------------------------------------------------
+// Worker instructions (interactive pi workers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Send a task instruction to a worker's interactive pi. Writes the per-round
+ * prompt file and submits a single-line instruction carrying a unique
+ * completion marker (DONE-<ID>-<round>). The worker pane is reused across
+ * rounds so it keeps context; only a crashed/missing pane is relaunched.
+ */
+function instructWorker(
   state: DispatchState,
   ticket: TicketState,
-  reason: string,
-  ctx: ReapContext
+  role: "implementer" | "reviewer",
+  worker: WorkerInfo,
+  deps: ResolvedDeps,
+  opts?: { reason?: string }
 ): void {
-  const attempt = {
-    type: ticket.status === "fixing" ? ("fix" as const) : ("implement" as const),
-    startedAt: ticket.implementer?.startedAt ?? Date.now(),
-    endedAt: Date.now(),
-    outcome: "failure" as const,
-    notes: reason,
-    workerName: ticket.implementer?.agentName ?? "unknown",
-  };
-  const updated = addAttempt(ticket, attempt);
-  updated.implementer = undefined;
+  const id = ticket.ticket.id;
+  const round = worker.round ?? ticket.round;
+  const workDir = ticketWorkDir(state, id);
+  fs.mkdirSync(workDir, { recursive: true });
 
-  if (updated.attemptCount < updated.maxAttempts) {
-    // Stay implementing/fixing; launch() will start the next round.
-    state.tickets[ticket.ticket.id] = updated;
-    ctx.changed = true;
-    // We will report worker_started when the relaunch happens; nothing yet.
-    return;
-  }
+  const promptPath = promptFile(state, id, round);
+  const verdictPath = verdictFile(state, id, round);
+  const prompt =
+    role === "reviewer"
+      ? buildReviewerPrompt({ state, ticket, verdict: verdictPath })
+      : buildImplementerPrompt({
+          state,
+          ticket,
+          feedback: opts?.reason ?? ticket.reviewFeedback,
+        });
+  fs.writeFileSync(promptPath, prompt, "utf-8");
 
-  const failed = { ...updated, status: "failed" as const, errorMessage: reason };
-  state.tickets[ticket.ticket.id] = failed;
-  ctx.events.push({
-    type: "ticket_failed",
-    ticketId: ticket.ticket.id,
-    reason: `exceeded ${ticket.maxAttempts} implementation attempts: ${reason}`,
+  const marker = roundMarker(id, round);
+  const instruction = buildTaskInstruction({
+    promptFile: promptPath,
+    marker,
+    extra:
+      role === "reviewer"
+        ? "Do not modify any files and do not commit anything."
+        : undefined,
   });
-  ctx.changed = true;
+
+  deps.herdr.sendText(worker.agentName, instruction);
+  deps.herdr.sendKey(worker.paneId, "Enter");
+  deps.log?.(`instructed ${role} ${worker.agentName} (round ${round}, marker ${marker})`);
 }
 
-/** Detect finished/crashed workers and apply transitions. */
+/** Wait for an interactive pi worker to finish starting up (herdr idle). */
+async function waitForWorkerIdle(
+  deps: ResolvedDeps,
+  worker: WorkerInfo,
+  timeoutMs = 60_000
+): Promise<boolean> {
+  const deadline = deps.now() + timeoutMs;
+  while (deps.now() < deadline) {
+    if (deps.herdr.waitAgentIdle(worker.agentName, 5_000)) return true;
+    await deps.sleep(Math.min(1_000, deadline - deps.now()));
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Phase: reap completed workers (interactive: marker detection + git verify)
+// ---------------------------------------------------------------------------
+
 function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps): void {
   for (const id of activeTicketsToProcess(state, ctx.only)) {
     const ticket = state.tickets[id];
@@ -214,45 +246,84 @@ function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps)
     const worker = activeWorker(ticket);
     if (!worker?.paneId) continue;
     const round = worker.round ?? ticket.round;
+    const marker = roundMarker(id, round);
 
-    const exitPath = exitFile(state, id, round);
-    const exitContent = readIfExists(exitPath);
-
-    if (exitContent !== undefined) {
-      // Worker finished. Process the outcome.
-      const exitCode = parseInt(exitContent.trim(), 10);
-      const workerLog = tailFile(logFile(state, id, round), 10);
-      const isReviewer = ticket.status === "reviewing";
-      if (isReviewer) {
-        reapReviewerDone(state, ticket, worker, round, exitCode, workerLog, ctx);
+    // Crashed: pane gone without producing a marker -> relaunch (or fail).
+    if (!deps.herdr.paneExists(worker.paneId)) {
+      if (ticket.status === "reviewing") {
+        restartReviewer(state, ticket, worker, ctx);
       } else {
-        reapImplementerDone(state, ticket, worker, round, exitCode, workerLog, ctx);
+        crashImplementer(state, ticket, worker, ctx);
       }
       continue;
     }
 
-    // No exit file yet. Is the pane still alive?
-    if (deps.herdr.paneExists(worker.paneId)) {
-      // Still running; nothing to do.
-      continue;
+    const paneText = deps.herdr.readPane(worker.paneId, 120);
+    // Line-exact marker match: the instruction itself contains the marker text
+    // (it is echoed in the TUI), so a substring match would always succeed.
+    const markerSeen = paneText
+      .split("\n")
+      .some((line) => line.trim() === marker);
+    if (!markerSeen) {
+      // Still running. Timeout?
+      if (deps.now() - worker.startedAt > WORKER_TIMEOUT_MS) {
+        state.runStatus = "waiting_human";
+        state.statusMessage = `worker ${worker.agentName} (ticket ${id}) ran for over ${Math.round(WORKER_TIMEOUT_MS / 60_000)} minutes without completing`;
+        ctx.events.push({
+          type: "waiting_human",
+          reason: `worker ${worker.agentName} for ticket ${id} timed out without completing; resolve with retry_launch (restart the worker), fail_ticket, or cancel_run`,
+          ticketId: id,
+          options: ["retry_launch", "fail_ticket", "cancel_run"],
+        });
+        ctx.changed = true;
+        return; // stop the cascade; ask the human
+      }
+      continue; // still working
     }
 
-    // Pane is gone and no exit file: the worker died (crash/kill). Relaunch
-    // or fail, counting as a failed attempt.
+    // Marker found: the worker finished its round.
     if (ticket.status === "reviewing") {
-      reviewerCrashed(state, ticket, worker, ctx);
+      handleReviewerDone(state, ticket, worker, round, ctx, deps);
     } else {
-      failOrRetryImplementer(
-        state,
-        ticket,
-        `worker ${worker.agentName} died without completing (pane ${worker.paneId} is gone, no exit file)`,
-        ctx
-      );
+      handleImplementerDone(state, ticket, worker, round, ctx, deps);
     }
   }
 }
 
-function reviewerCrashed(
+/** An implementer pane vanished mid-round: count it and relaunch (or fail). */
+function crashImplementer(
+  state: DispatchState,
+  ticket: TicketState,
+  worker: WorkerInfo,
+  ctx: ReapContext
+): void {
+  const id = ticket.ticket.id;
+  const updated = addAttempt(ticket, {
+    type: ticket.status === "fixing" ? ("fix" as const) : ("implement" as const),
+    startedAt: worker.startedAt,
+    endedAt: Date.now(),
+    outcome: "failure",
+    notes: `worker ${worker.agentName} crashed (pane ${worker.paneId} gone)`,
+    workerName: worker.agentName,
+  });
+  if (updated.attemptCount < updated.maxAttempts) {
+    updated.implementer = undefined; // launchWorkers() relaunches
+    state.tickets[id] = updated;
+    ctx.changed = true;
+    return;
+  }
+  const failed = { ...updated, status: "failed" as const, errorMessage: "worker crashed repeatedly" };
+  state.tickets[id] = failed;
+  ctx.events.push({
+    type: "ticket_failed",
+    ticketId: id,
+    reason: "worker crashed without completing",
+  });
+  ctx.changed = true;
+}
+
+/** A reviewer pane vanished mid-round: retry the reviewer (or fail). */
+function restartReviewer(
   state: DispatchState,
   ticket: TicketState,
   worker: WorkerInfo,
@@ -264,11 +335,11 @@ function reviewerCrashed(
     startedAt: worker.startedAt,
     endedAt: Date.now(),
     outcome: "failure",
-    notes: `reviewer ${worker.agentName} died without a verdict`,
+    notes: `reviewer ${worker.agentName} crashed (pane ${worker.paneId} gone)`,
     workerName: worker.agentName,
   });
   if (countAttempts(updated, "review") < ticket.maxAttempts) {
-    updated.reviewer = undefined;
+    updated.reviewer = undefined; // launchWorkers() relaunches
     state.tickets[id] = updated;
     ctx.changed = true;
     return;
@@ -287,82 +358,122 @@ function reviewerCrashed(
   ctx.changed = true;
 }
 
-function reapImplementerDone(
+/** Implementer finished its round: verify git; success -> ready/reviewing, else re-instruct. */
+function handleImplementerDone(
   state: DispatchState,
   ticket: TicketState,
   worker: WorkerInfo,
-  _round: number,
-  exitCode: number,
-  workerLog: string,
-  ctx: ReapContext
+  round: number,
+  ctx: ReapContext,
+  deps: ResolvedDeps
 ): void {
   const id = ticket.ticket.id;
   const worktree = ticket.worktreePath ?? worker.worktreePath;
 
   if (
-    exitCode === 0 &&
     worktree &&
     git.hasNewCommits(worktree, state.baseBranch) &&
     !git.isWorktreeDirty(worktree)
   ) {
-    // Success: implementation committed and clean.
     const commitSha = git.getHeadCommit(worktree);
-    const attempt = {
+    const updated = addAttempt(ticket, {
       type: ticket.status === "fixing" ? ("fix" as const) : ("implement" as const),
       startedAt: worker.startedAt,
       endedAt: Date.now(),
-      outcome: "success" as const,
+      outcome: "success",
       notes: commitSha,
       workerName: worker.agentName,
-    };
-    const updated = addAttempt(ticket, attempt);
+    });
     updated.lastCommit = commitSha;
     updated.reviewFeedback = undefined;
-
-    if (state.useReviewer) {
-      updated.status = "reviewing";
-    } else {
-      updated.status = "ready";
-    }
+    updated.status = state.useReviewer ? "reviewing" : "ready";
     state.tickets[id] = updated;
     ctx.events.push({ type: "implementation_ready", ticketId: id, commitSha });
     ctx.changed = true;
     return;
   }
 
-  // Failure: bad exit, no commits, or dirty tree.
-  const reason =
-    exitCode !== 0
-      ? `worker exited with code ${exitCode}; ${workerLog.slice(0, 150)}`
-      : !worktree
-        ? "worker worktree missing"
-        : git.isWorktreeDirty(worktree)
-          ? "worker left uncommitted changes"
-          : "worker made no commits";
-  failOrRetryImplementer(state, ticket, reason, ctx);
+  // Failed round: send a corrective instruction to the same worker (keeps
+  // context), bounded by maxAttempts.
+  const reason = !worktree
+    ? "your worktree is missing"
+    : git.isWorktreeDirty(worktree)
+      ? "you left uncommitted changes in the worktree"
+      : "you made no commits";
+  instructImplementerFix(state, ticket, worker, reason, ctx, deps);
 }
 
-function reapReviewerDone(
+/** Send a corrective instruction (new round, same pane) or fail the ticket. */
+function instructImplementerFix(
+  state: DispatchState,
+  ticket: TicketState,
+  worker: WorkerInfo,
+  reason: string,
+  ctx: ReapContext,
+  deps: ResolvedDeps
+): void {
+  const id = ticket.ticket.id;
+  const updated = addAttempt(ticket, {
+    type: ticket.status === "fixing" ? ("fix" as const) : ("implement" as const),
+    startedAt: worker.startedAt,
+    endedAt: Date.now(),
+    outcome: "failure",
+    notes: reason,
+    workerName: worker.agentName,
+  });
+  if (updated.attemptCount >= updated.maxAttempts) {
+    const failed = { ...updated, status: "failed" as const, errorMessage: reason };
+    state.tickets[id] = failed;
+    ctx.events.push({
+      type: "ticket_failed",
+      ticketId: id,
+      reason: `exceeded ${ticket.maxAttempts} implementation attempts: ${reason}`,
+    });
+    ctx.changed = true;
+    return;
+  }
+
+  const nextRound = updated.round + 1;
+  const nextWorker: WorkerInfo = { ...worker, round: nextRound, startedAt: deps.now() };
+  if (updated.status === "reviewing") {
+    // came from a rejected review -> fixing round
+    updated.status = "fixing";
+  }
+  updated.implementer = nextWorker;
+  updated.round = nextRound;
+  state.tickets[id] = updated;
+  instructWorker(state, updated, "implementer", nextWorker, deps, {
+    reason: `Your previous attempt did not pass verification: ${reason}. Fix it, commit, and reply with the marker.`,
+  });
+  ctx.events.push({
+    type: "worker_retrying",
+    ticketId: id,
+    round: nextRound,
+    reason: `implementation round did not pass verification: ${reason}`,
+  });
+  ctx.changed = true;
+}
+
+/** Reviewer finished its round: read the verdict file. */
+function handleReviewerDone(
   state: DispatchState,
   ticket: TicketState,
   worker: WorkerInfo,
   round: number,
-  exitCode: number,
-  workerLog: string,
-  ctx: ReapContext
+  ctx: ReapContext,
+  deps: ResolvedDeps
 ): void {
   const id = ticket.ticket.id;
   const verdict = parseVerdict(readIfExists(verdictFile(state, id, round)));
 
-  const attempt = {
-    type: "review" as const,
+  const updated = addAttempt(ticket, {
+    type: "review",
     startedAt: worker.startedAt,
     endedAt: Date.now(),
     outcome: verdict?.approved ? ("success" as const) : ("failure" as const),
-    notes: verdict?.feedback?.slice(0, 200) ?? workerLog.slice(0, 200),
+    notes: verdict?.feedback?.slice(0, 200) ?? "no verdict file",
     workerName: worker.agentName,
-  };
-  const updated = addAttempt(ticket, attempt);
+  });
 
   if (verdict?.approved) {
     updated.status = "ready";
@@ -373,59 +484,74 @@ function reapReviewerDone(
   }
 
   const feedback = verdict?.feedback ?? "(no actionable feedback provided)";
-  if (exitCode !== 0 || verdict === undefined) {
-    // Reviewer did not produce a usable verdict. Retry the reviewer (bounded).
-    if (countAttempts(updated, "review") < ticket.maxAttempts) {
-      updated.reviewer = undefined;
-      state.tickets[id] = updated;
+  if (verdict === undefined) {
+    // Reviewer finished but produced no verdict file: re-instruct (bounded).
+    if (countAttempts(updated, "review") >= ticket.maxAttempts) {
+      const failed = {
+        ...updated,
+        status: "failed" as const,
+        errorMessage: "reviewer produced no verdict",
+      };
+      state.tickets[id] = failed;
+      ctx.events.push({ type: "ticket_failed", ticketId: id, reason: "reviewer produced no verdict" });
       ctx.changed = true;
       return;
     }
-    const failed = {
-      ...updated,
-      status: "failed" as const,
-      errorMessage: `reviewer did not produce a verdict after ${ticket.maxAttempts} attempts`,
-    };
-    state.tickets[id] = failed;
+    const nextRound = updated.round + 1;
+    const nextWorker: WorkerInfo = { ...worker, round: nextRound, startedAt: deps.now() };
+    updated.reviewer = nextWorker;
+    updated.round = nextRound;
+    state.tickets[id] = updated;
+    instructWorker(state, updated, "reviewer", nextWorker, deps, {
+      reason: "You must create the verdict file at the path given in your instructions.",
+    });
     ctx.events.push({
-      type: "ticket_failed",
+      type: "worker_retrying",
       ticketId: id,
-      reason: "reviewer produced no verdict",
+      round: nextRound,
+      reason: "reviewer finished without producing a verdict file",
     });
     ctx.changed = true;
     return;
   }
 
-  // Reviewer rejected with feedback. Bound by implementation attempts.
-  if (ticket.attemptCount < ticket.maxAttempts) {
-    updated.status = "fixing";
-    updated.reviewFeedback = feedback;
-    updated.reviewer = undefined; // clear stale reviewer record for the next review round
-    updated.implementer = undefined; // launch() starts the fix round
-    state.tickets[id] = updated;
-    ctx.events.push({ type: "review_completed", ticketId: id, approved: false, feedback });
+  // Rejected with feedback -> fixing round on the implementer pane.
+  if (ticket.attemptCount >= ticket.maxAttempts) {
+    const failed = {
+      ...updated,
+      status: "failed" as const,
+      errorMessage: "fix loop exceeded max implementation attempts",
+      reviewFeedback: feedback,
+    };
+    state.tickets[id] = failed;
+    ctx.events.push({
+      type: "ticket_failed",
+      ticketId: id,
+      reason: "fix loop exceeded max implementation attempts",
+    });
     ctx.changed = true;
     return;
   }
-
-  const failed = {
-    ...updated,
-    status: "failed" as const,
-    errorMessage: "fix loop exceeded max implementation attempts",
-    reviewFeedback: feedback,
-  };
-  state.tickets[id] = failed;
-  ctx.events.push({
-    type: "ticket_failed",
-    ticketId: id,
-    reason: "fix loop exceeded max implementation attempts",
-  });
+  const implementer = ticket.implementer;
+  updated.status = "fixing";
+  updated.reviewFeedback = feedback;
+  updated.reviewer = undefined;
+  if (implementer?.paneId) {
+    // Reuse the implementer pane with feedback (keeps context).
+    const nextRound = updated.round + 1;
+    const nextWorker: WorkerInfo = { ...implementer, round: nextRound, startedAt: deps.now() };
+    updated.implementer = nextWorker;
+    updated.round = nextRound;
+    state.tickets[id] = updated;
+    instructWorker(state, updated, "implementer", nextWorker, deps, {
+      reason: feedback,
+    });
+  } else {
+    state.tickets[id] = updated;
+  }
+  ctx.events.push({ type: "review_completed", ticketId: id, approved: false, feedback });
   ctx.changed = true;
 }
-
-// ---------------------------------------------------------------------------
-// Phase: integrate ready tickets
-// ---------------------------------------------------------------------------
 
 /** Apply unblockDependents in place (unblockDependents returns a new object). */
 function applyUnblock(state: DispatchState, integratedTicketId: string): void {
@@ -481,22 +607,19 @@ function integrateReady(state: DispatchState, ctx: ReapContext, _deps: ResolvedD
 // Phase: launch workers
 // ---------------------------------------------------------------------------
 
-function launchWorkerFor(
+async function launchWorkerFor(
   state: DispatchState,
   ticket: TicketState,
   role: "implementer" | "reviewer",
   ctx: ReapContext,
   deps: ResolvedDeps
-): void {
+): Promise<void> {
   const id = ticket.ticket.id;
   const round = ticket.round + 1;
   const workDir = ticketWorkDir(state, id);
   fs.mkdirSync(workDir, { recursive: true });
 
   const isReviewer = role === "reviewer";
-  const promptPath = promptFile(state, id, round);
-  const logPath = logFile(state, id, round);
-  const exitPath = exitFile(state, id, round);
   const verdictPath = verdictFile(state, id, round);
 
   // Worktree must exist (cleanup may have removed it).
@@ -522,17 +645,22 @@ function launchWorkerFor(
     return;
   }
 
-  // Build the prompt file.
-  const prompt = isReviewer
-    ? buildReviewerPrompt({ state, ticket, verdict: verdictPath })
-    : buildImplementerPrompt({
-        state,
-        ticket,
-        feedback: ticket.reviewFeedback,
-      });
-  fs.writeFileSync(promptPath, prompt, "utf-8");
+  // The prompt file (written by instructWorker on the same round) and verdict
+  // path are prepared up front so the worker can be instructed right away.
+  if (isReviewer) {
+    fs.writeFileSync(
+      promptFile(state, id, round),
+      buildReviewerPrompt({ state, ticket, verdict: verdictPath }),
+      "utf-8"
+    );
+  } else {
+    fs.writeFileSync(
+      promptFile(state, id, round),
+      buildImplementerPrompt({ state, ticket, feedback: ticket.reviewFeedback }),
+      "utf-8"
+    );
+  }
 
-  const script = buildWorkerScript(promptPath, logPath, exitPath);
   const agentName = workerAgentName(id, round, isReviewer ? "review" : "impl");
   const workspaceLabel = `ticket ${id}`;
 
@@ -551,7 +679,7 @@ function launchWorkerFor(
   try {
     started = deps.herdr.startAgent({
       name: agentName,
-      argv: ["sh", "-c", script],
+      argv: ["pi"],
       cwd: worktree,
       workspaceId,
       focus: false,
@@ -582,9 +710,8 @@ function launchWorkerFor(
     workspaceId: started.workspaceId,
   };
 
-  // Attempts are recorded on completion (reap), not at launch, so the
-  // attemptCount bound reflects completed attempts. round/worktree/worker
-  // are persisted immediately for crash recovery.
+  // Persist the worker immediately (crash recovery), then wait for the
+  // interactive pi to become ready and send the task instruction.
   const updated: TicketState = {
     ...ticket,
     round,
@@ -597,20 +724,32 @@ function launchWorkerFor(
     updated.implementer = workerInfo;
     if (updated.status === "pending") updated.status = "implementing";
   }
-
   state.tickets[id] = updated;
+  saveState(state);
+
+  if (!(await waitForWorkerIdle(deps, workerInfo))) {
+    deps.log?.(`worker ${agentName} did not become idle; will retry the instruction on a later advance`);
+    ctx.events.push(
+      isReviewer
+        ? { type: "reviewer_started", ticketId: id }
+        : { type: "worker_started", ticketId: id, workerName: agentName }
+    );
+    ctx.changed = true;
+    return;
+  }
+  instructWorker(state, state.tickets[id], isReviewer ? "reviewer" : "implementer", workerInfo, deps);
+  state.tickets[id].updatedAt = deps.now();
+  saveState(state);
+
   ctx.events.push(
     isReviewer
       ? { type: "reviewer_started", ticketId: id }
       : { type: "worker_started", ticketId: id, workerName: agentName }
   );
   ctx.changed = true;
-  // Persist immediately after each launch so a crash can't orphan a pane
-  // while the state still says "pending".
-  saveState(state);
 }
 
-function launchWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps): void {
+async function launchWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps): Promise<void> {
   const running = Object.values(state.tickets).filter(
     (ts) => ["implementing", "reviewing", "fixing"].includes(ts.status) && activeWorker(ts)?.paneId
   ).length;
@@ -623,12 +762,12 @@ function launchWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDep
     if (capacity <= 0) return;
     const ticket = state.tickets[id];
     if (ticket.status === "reviewing" && !ticket.reviewer?.paneId) {
-      launchWorkerFor(state, ticket, "reviewer", ctx, deps);
+      await launchWorkerFor(state, ticket, "reviewer", ctx, deps);
       capacity -= 1;
     }
   }
 
-  // 2) Relaunch implementers for tickets whose worker was cleared (retry/fix).
+  // 2) Relaunch implementers for tickets whose worker was cleared (crash).
   for (const id of activeTicketsToProcess(state, ctx.only)) {
     if (capacity <= 0) return;
     const ticket = state.tickets[id];
@@ -636,7 +775,7 @@ function launchWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDep
       (ticket.status === "implementing" || ticket.status === "fixing") &&
       !ticket.implementer?.paneId
     ) {
-      launchWorkerFor(state, ticket, "implementer", ctx, deps);
+      await launchWorkerFor(state, ticket, "implementer", ctx, deps);
       capacity -= 1;
     }
   }
@@ -645,7 +784,7 @@ function launchWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDep
   for (const id of getReadyTickets(state)) {
     if (capacity <= 0) return;
     if (ctx.only && !ctx.only.includes(id)) continue;
-    launchWorkerFor(state, state.tickets[id], "implementer", ctx, deps);
+    await launchWorkerFor(state, state.tickets[id], "implementer", ctx, deps);
     capacity -= 1;
   }
 }
@@ -757,7 +896,7 @@ export async function dispatchAdvance(
     const ctx: ReapContext = { events, changed: false, only };
     reapWorkers(state, ctx, deps);
     if (!waiting()) integrateReady(state, ctx, deps);
-    if (!waiting()) launchWorkers(state, ctx, deps);
+    if (!waiting()) await launchWorkers(state, ctx, deps);
     const progressed = ctx.changed || fingerprint(state) !== before;
     if (progressed) saveState(state);
     if (!progressed) break;
@@ -775,7 +914,7 @@ export async function dispatchAdvance(
         reapWorkers(state, ctx, deps);
         if (ctx.changed) {
           integrateReady(state, ctx, deps);
-          launchWorkers(state, ctx, deps);
+          await launchWorkers(state, ctx, deps);
           saveState(state);
           break;
         }
@@ -913,7 +1052,7 @@ export function dispatchStatus(
 /** Resolve a waiting_human decision. */
 export function dispatchResolve(
   input: Extract<DispatchInput, { action: "resolve" }>,
-  _depsIn: DispatcherDeps
+  depsIn: DispatcherDeps
 ): DispatchResult {
   const state = loadState(path.resolve(input.targetRepo));
   const choice = input.choice;
@@ -923,10 +1062,22 @@ export function dispatchResolve(
     if (state.runStatus !== "waiting_human") {
       throw new Error('resolve choice "retry_launch" requires a waiting_human run.');
     }
+    // Close and clear every active worker so the next advance relaunches it.
+    for (const ts of Object.values(state.tickets)) {
+      if (!["implementing", "reviewing", "fixing"].includes(ts.status)) continue;
+      for (const worker of [ts.implementer, ts.reviewer]) {
+        if (worker?.paneId) depsIn.herdr.closePane(worker.paneId);
+      }
+      state.tickets[ts.ticket.id] = {
+        ...ts,
+        implementer: undefined,
+        reviewer: undefined,
+      };
+    }
     state.runStatus = "running";
     state.statusMessage = undefined;
     saveState(state);
-    return buildResult("resolve", state, events, "Launch retry queued; call advance to retry.");
+    return buildResult("resolve", state, events, "Workers cleared; call advance to relaunch.");
   }
 
   if (choice === "cancel_run") {

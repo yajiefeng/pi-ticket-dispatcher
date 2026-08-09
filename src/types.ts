@@ -127,6 +127,7 @@ export type DispatchAction =
 /** Structured events returned by advance/start actions. */
 export type DispatchEvent =
   | { type: "worker_started"; ticketId: string; workerName: string }
+  | { type: "worker_retrying"; ticketId: string; round: number; reason: string }
   | { type: "implementation_ready"; ticketId: string; commitSha: string }
   | { type: "reviewer_started"; ticketId: string }
   | { type: "review_completed"; ticketId: string; approved: boolean; feedback?: string }

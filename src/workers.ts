@@ -192,3 +192,31 @@ export function activeWorker(ticket: TicketState): WorkerInfo | undefined {
   if (ticket.status === "reviewing") return ticket.reviewer;
   return ticket.implementer;
 }
+
+/**
+ * Unique completion marker for one worker round. The worker must reply with
+ * exactly this token when finished, so completion detection is unambiguous
+ * even after retries/resumes (old markers from earlier rounds are ignored).
+ */
+export function roundMarker(ticketId: string, round: number): string {
+  return `DONE-${sanitizeId(ticketId).toUpperCase()}-${round}`;
+}
+
+/**
+ * The single-line instruction sent to an interactive worker. The full task
+ * brief lives in a file (written by the dispatcher); the worker reads it,
+ * executes, and replies with the marker when done.
+ */
+export function buildTaskInstruction(params: {
+  promptFile: string;
+  marker: string;
+  extra?: string;
+}): string {
+  const { promptFile, marker, extra } = params;
+  const lines = [
+    `Read the file ${promptFile} and follow its instructions completely.`,
+    ...(extra ? [extra] : []),
+    `When you are done, reply on a single line with exactly: ${marker}`,
+  ];
+  return lines.join(" ");
+}

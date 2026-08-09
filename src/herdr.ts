@@ -40,6 +40,14 @@ export interface HerdrAdapter {
   paneExists(paneId: string): boolean;
   /** Close a pane. Errors are swallowed (the pane may already be gone). */
   closePane(paneId: string): void;
+  /** Send literal text to an agent (no Enter). */
+  sendText(target: string, text: string): void;
+  /** Send a key (e.g. "Enter") to a pane. */
+  sendKey(paneId: string, key: string): void;
+  /** Read recent pane content (plain text, may include TUI rendering). */
+  readPane(paneId: string, lines?: number): string;
+  /** True if the agent reports idle (started up, waiting for input). */
+  waitAgentIdle(target: string, timeoutMs: number): boolean;
   /** Create a dedicated workspace for a ticket's worker. */
   createWorkspace(opts: { label: string; cwd?: string }): { workspaceId: string };
   /** Close a workspace we created. Errors are swallowed. */
@@ -117,28 +125,18 @@ function herdrMaybe(args: string[]): { ok: boolean; output: string } {
 }
 
 /**
- * Herdr 0.8+ worker launch: find or create a pane whose shell will run the
- * worker script, then submit the script via `pane run`.
- *
- * Note: unlike 0.7.x (where herdr auto-closes the pane when the process
- * exits), the pane here keeps its shell alive after the script finishes, so
- * completion is detected purely via the exit-code file and crash detection
- * (pane-gone) does not apply; cleanup closes the pane.
+ * Herdr 0.8+ worker launch: the `agent start` CLI changed to
+ * "declare an existing pane as an agent" (--kind KIND --pane ID). For an
+ * interactive worker we create a pane (pane split --cwd) and then declare it
+ * as a pi agent with no extra args, which starts `pi` in that pane. This
+ * keeps herdr's agent detection + status reporting for both versions.
  */
 function startAgentV8(opts: {
   name: string;
-  argv: string[];
   cwd?: string;
   workspaceId?: string;
 }): StartAgentResult {
-  const { name, argv, cwd, workspaceId } = opts;
-
-  // Extract the worker script. Workers are launched as sh -c '<script>';
-  // the pane's interactive shell executes the script body directly.
-  const script =
-    argv.length === 3 && argv[0] === "sh" && argv[1] === "-c"
-      ? argv[2]
-      : argv.join(" ");
+  const { name, cwd, workspaceId } = opts;
 
   let paneId: string;
   let wsId = workspaceId;
@@ -169,22 +167,22 @@ function startAgentV8(opts: {
     throw new Error("startAgent (v8) requires a workspaceId or cwd");
   }
 
-  const run = spawnSync(herdrBin(), ["pane", "run", paneId, script], {
-    encoding: "utf-8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (run.status !== 0) {
-    throw new Error(
-      `${herdrBin()} pane run exited ${run.status}: ${(run.stderr || run.stdout || "").trim()}`
-    );
-  }
+  const result = herdrJson<{
+    agent: {
+      pane_id: string;
+      workspace_id: string;
+      tab_id: string;
+      terminal_id: string;
+      name: string;
+    };
+  }>(["agent", "start", name, "--kind", "pi", "--pane", paneId]);
 
   return {
-    paneId,
-    workspaceId: wsId ?? "",
-    tabId: "",
-    terminalId: "",
-    name,
+    paneId: result.agent.pane_id,
+    workspaceId: result.agent.workspace_id,
+    tabId: result.agent.tab_id,
+    terminalId: result.agent.terminal_id,
+    name: result.agent.name,
   };
 }
 
@@ -192,7 +190,7 @@ function startAgentV8(opts: {
 export const herdrAdapter: HerdrAdapter = {
   startAgent({ name, argv, cwd, workspaceId, focus }) {
     if (usesNewAgentApi()) {
-      return startAgentV8({ name, argv, cwd, workspaceId });
+      return startAgentV8({ name, cwd, workspaceId });
     }
 
     const args = ["agent", "start", name];
@@ -231,6 +229,54 @@ export const herdrAdapter: HerdrAdapter = {
   closePane(paneId) {
     if (!paneId) return;
     herdrMaybe(["pane", "close", paneId]);
+  },
+
+  sendText(target, text) {
+    const r = spawnSync(herdrBin(), ["agent", "send", target, text], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (r.status !== 0) {
+      throw new Error(
+        `${herdrBin()} agent send exited ${r.status}: ${(r.stderr || r.stdout || "").trim()}`
+      );
+    }
+  },
+
+  sendKey(paneId, key) {
+    herdrMaybe(["pane", "send-keys", paneId, key]);
+  },
+
+  readPane(paneId, lines = 80) {
+    const r = spawnSync(
+      herdrBin(),
+      ["pane", "read", paneId, "--source", "recent", "--lines", String(lines)],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }
+    );
+    if (r.status !== 0) return "";
+    try {
+      const parsed = JSON.parse(r.stdout);
+      return parsed?.result?.read?.text ?? "";
+    } catch {
+      return r.stdout;
+    }
+  },
+
+  waitAgentIdle(target, timeoutMs) {
+    const r = spawnSync(
+      herdrBin(),
+      ["agent", "wait", target, "--status", "idle", "--timeout", String(timeoutMs)],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }
+    );
+    if (r.status !== 0) return false;
+    // `agent wait` returns exit 0 even when the target is not idle yet, so we
+    // must inspect the reported agent_status ourselves.
+    try {
+      const parsed = JSON.parse(r.stdout);
+      return parsed?.result?.agent?.agent_status === "idle";
+    } catch {
+      return false;
+    }
   },
 
   createWorkspace({ label, cwd }) {

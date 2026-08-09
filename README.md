@@ -22,12 +22,14 @@ Herdr
 
 - **No daemon.** The extension registers one tool and does nothing at load
   time. All side effects happen inside `ticket_dispatch` calls.
-- **Workers are one-shot `pi -p` processes** launched by Herdr into per-ticket
-  git worktrees (each in its own Herdr workspace). They write their output and
-  exit code to files because Herdr closes the pane when the process exits.
+- **Workers are interactive `pi` processes** launched by Herdr into per-ticket
+  git worktrees (each in its own Herdr workspace). You can watch them work and
+  see their Herdr `working`/`idle` status; each round is submitted as a
+  single-line instruction carrying a unique completion marker
+  (`DONE-<ID>-<round>`) that the worker replies with when done.
 - **State lives in `<targetRepo>/.pi-ticket-dispatcher/state.json`** and is
   written atomically around every side effect, so interrupted runs resume
-  cleanly (interrupted workers are detected and relaunched, counting as an
+  cleanly (a vanished worker pane is detected and relaunched, counting as an
   attempt).
 
 ## Install
@@ -128,10 +130,12 @@ agent" (`--kind KIND --pane ID`), and it shell-quotes all arguments, so worker
 scripts can no longer be launched through it. The dispatcher detects the herdr
 version automatically:
 
-- **0.7.x** — workers are launched with `agent start`; Herdr auto-closes the
-  pane when the worker exits, so crashes are detected by a vanished pane.
-- **0.8+** — workers are launched via `pane split --cwd` (or an existing
-  ticket workspace's pane) + `pane run <script>`. The pane's shell stays
-  alive after the script exits, so completion is detected purely via the
-  exit-code file and crash detection is not available on this path; worker
-  panes are closed by `cleanup`.
+- **0.7.x** — workers are launched with `agent start <name> --cwd <worktree> -- pi`.
+- **0.8+** — `agent start` changed to `--kind KIND --pane ID`; the dispatcher
+  creates a pane (`pane split --cwd` or the ticket workspace's pane) and
+  declares it as a pi agent, which starts the same interactive worker.
+
+Either way the worker is a real interactive `pi`, so Herdr reports
+`working`/`idle` and the TUI is visible. Completion is always detected by the
+round marker + git verification; a worker that runs over 20 minutes without
+completing pauses the run with `waiting_human`.

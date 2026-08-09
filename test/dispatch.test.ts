@@ -39,14 +39,15 @@ function makeGitRepo(): string {
 }
 
 class FakeHerdr implements HerdrAdapter {
-  panes = new Map<string, { name: string; cwd: string; argv: string[]; workspaceId?: string }>();
+  panes = new Map<string, { name: string; cwd: string; argv: string[]; workspaceId?: string; content: string }>();
   workspaces = new Map<string, string>();
+  sent: Array<{ target: string; text: string }> = [];
   private paneSeq = 0;
   private wsSeq = 0;
 
   startAgent(opts: { name: string; argv: string[]; cwd?: string; workspaceId?: string; focus?: boolean }) {
     const paneId = `p${++this.paneSeq}`;
-    this.panes.set(paneId, { name: opts.name, cwd: opts.cwd ?? "", argv: opts.argv, workspaceId: opts.workspaceId });
+    this.panes.set(paneId, { name: opts.name, cwd: opts.cwd ?? "", argv: opts.argv, workspaceId: opts.workspaceId, content: "" });
     return {
       paneId,
       workspaceId: opts.workspaceId ?? `w${++this.wsSeq}`,
@@ -61,6 +62,16 @@ class FakeHerdr implements HerdrAdapter {
   closePane(paneId: string): void {
     this.panes.delete(paneId);
   }
+  sendText(target: string, text: string): void {
+    this.sent.push({ target, text });
+  }
+  sendKey(_paneId: string, _key: string): void {}
+  readPane(paneId: string): string {
+    return this.panes.get(paneId)?.content ?? "";
+  }
+  waitAgentIdle(_target: string, _timeoutMs: number): boolean {
+    return true;
+  }
   createWorkspace(opts: { label: string; cwd?: string }) {
     const id = `w${++this.wsSeq}`;
     this.workspaces.set(id, opts.label);
@@ -71,18 +82,22 @@ class FakeHerdr implements HerdrAdapter {
   }
 
   // -- test helpers ---------------------------------------------------------
-  /** The script of the most recently started pane. */
-  scriptOf(paneId: string): string {
-    return this.panes.get(paneId)!.argv[2];
+  /** The last instruction sent to a pane's agent. */
+  lastInstruction(paneId: string): { target: string; text: string } {
+    const name = this.panes.get(paneId)!.name;
+    const last = [...this.sent].reverse().find((s) => s.target === name);
+    assert.ok(last, `no instruction sent to ${name}`);
+    return last!;
   }
-  exitPathOf(paneId: string): string {
-    const m = this.scriptOf(paneId).match(/echo \$\? > "([^"]+)"/);
-    assert.ok(m, `no exit path in script: ${this.scriptOf(paneId)}`);
+  /** The unique completion marker in the last instruction sent to this pane. */
+  markerOf(paneId: string): string {
+    const m = this.lastInstruction(paneId).text.match(/(DONE-[A-Z0-9_-]+-\d+)/);
+    assert.ok(m, `no marker in instruction: ${this.lastInstruction(paneId).text}`);
     return m![1];
   }
   promptContentOf(paneId: string): string {
-    const m = this.scriptOf(paneId).match(/"([^"]+\.prompt\.md)"/);
-    assert.ok(m, `no prompt path in script: ${this.scriptOf(paneId)}`);
+    const m = this.lastInstruction(paneId).text.match(/Read the file (\S+)/);
+    assert.ok(m, `no prompt path in instruction`);
     return fs.readFileSync(m![1], "utf-8");
   }
   verdictPathOf(paneId: string): string {
@@ -102,11 +117,12 @@ class FakeHerdr implements HerdrAdapter {
       throw e;
     }
   }
-  /** Simulate the worker finishing with a given exit code. */
-  workerExits(paneId: string, exitCode: number): void {
-    fs.writeFileSync(this.exitPathOf(paneId), String(exitCode), "utf-8");
+  /** Simulate the worker replying with its completion marker (round done). */
+  workerDone(paneId: string): void {
+    const pane = this.panes.get(paneId)!;
+    pane.content = (pane.content ? pane.content + "\n" : "") + this.markerOf(paneId);
   }
-  /** Simulate a crash: pane disappears without writing an exit file. */
+  /** Simulate a crash: pane disappears without a completion marker. */
   workerCrashes(paneId: string): void {
     this.panes.delete(paneId);
   }
@@ -173,7 +189,7 @@ test("full run: start -> implement -> integrate -> unlock -> complete", async ()
   // Worker completes with a clean commit.
   const p1 = herdr.panes.keys().next().value as string;
   herdr.workerCommits(p1);
-  herdr.workerExits(p1, 0);
+  herdr.workerDone(p1);
 
   // Advance 2: TKT-001 ready -> integrated -> TKT-002 unblocked -> started.
   r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
@@ -191,7 +207,7 @@ test("full run: start -> implement -> integrate -> unlock -> complete", async ()
   // TKT-002 worker completes (distinct change: TKT-001's file is already merged).
   const p2 = [...herdr.panes.keys()].pop() as string;
   herdr.workerCommits(p2, "farewell.txt", "bye");
-  herdr.workerExits(p2, 0);
+  herdr.workerDone(p2);
 
   // Advance 3: run completes.
   r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
@@ -219,7 +235,7 @@ test("advance waits for a worker completion within waitMs", async () => {
   // Complete the worker 100ms into the wait; advance should pick it up.
   setTimeout(() => {
     herdr.workerCommits(p1);
-    herdr.workerExits(p1, 0);
+    herdr.workerDone(p1);
   }, 100);
 
   const r = await run({ action: "advance", targetRepo: repo, waitMs: 2000 }, herdr);
@@ -239,15 +255,15 @@ test("failed attempt relaunches, then exceeds maxAttempts and fails", async () =
   );
   await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
 
-  // Attempt 1 fails (exit 1, no commits).
+  // Attempt 1 fails (no commits): the same worker is told to fix it.
   let p = herdr.panes.keys().next().value as string;
-  herdr.workerExits(p, 1);
+  herdr.workerDone(p);
   let r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
-  assert.deepEqual(eventTypes(r), ["worker_started"]); // relaunch
+  assert.deepEqual(eventTypes(r), ["worker_retrying"]);
+  assert.equal(r.tickets[0].attempts, 1);
 
   // Attempt 2 fails -> ticket fails.
-  p = [...herdr.panes.keys()].pop() as string;
-  herdr.workerExits(p, 1);
+  herdr.workerDone(p);
   r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.deepEqual(eventTypes(r), ["ticket_failed", "run_completed"]);
   assert.equal(r.summary["failed"], 1);
@@ -262,7 +278,7 @@ test("dirty worktree counts as a failed attempt", async () => {
   // Commits, but leaves an uncommitted change.
   herdr.workerCommits(p);
   fs.writeFileSync(path.join(herdr.panes.get(p)!.cwd, "leftover.txt"), "junk");
-  herdr.workerExits(p, 0);
+  herdr.workerDone(p);
   const r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.deepEqual(eventTypes(r), ["ticket_failed", "run_completed"]);
 });
@@ -293,35 +309,35 @@ test("reviewer approves -> integrates; reviewer rejects -> fix round", async () 
   await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
 
   // Implementer completes.
-  let p = herdr.panes.keys().next().value as string;
-  herdr.workerCommits(p);
-  herdr.workerExits(p, 0);
+  const implPane = herdr.panes.keys().next().value as string;
+  herdr.workerCommits(implPane);
+  herdr.workerDone(implPane);
   let r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.ok(eventTypes(r).includes("implementation_ready"));
   assert.ok(eventTypes(r).includes("reviewer_started"));
 
-  // Reviewer rejects with feedback -> fix round starts.
-  p = [...herdr.panes.keys()].pop() as string;
-  const verdictPath = herdr.verdictPathOf(p);
+  // Reviewer rejects with feedback -> fix round reuses the implementer pane.
+  const reviewPane1 = [...herdr.panes.keys()].pop() as string;
+  const verdictPath = herdr.verdictPathOf(reviewPane1);
   fs.writeFileSync(verdictPath, "APPROVED: no\nFEEDBACK: add more tests\n");
-  herdr.workerExits(p, 0);
+  herdr.workerDone(reviewPane1);
   r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.ok(eventTypes(r).includes("review_completed"));
   assert.equal(r.events.find((e) => e.type === "review_completed")!.approved, false);
-  assert.ok(eventTypes(r).includes("worker_started")); // fix round
+  // The fix round runs on the same implementer pane (keeps context).
+  assert.equal(herdr.panes.has(implPane), true);
 
   // Fix worker completes; reviewer approves -> integrates.
-  p = [...herdr.panes.keys()].pop() as string;
-  herdr.workerCommits(p, "more-tests.txt", "tests added");
-  herdr.workerExits(p, 0);
+  herdr.workerCommits(implPane, "more-tests.txt", "tests added");
+  herdr.workerDone(implPane);
   r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
 
   assert.ok(eventTypes(r).includes("implementation_ready"));
   assert.ok(eventTypes(r).includes("reviewer_started"));
-  p = [...herdr.panes.keys()].pop() as string;
-  const verdictPath2 = herdr.verdictPathOf(p);
+  const reviewPane2 = [...herdr.panes.keys()].pop() as string;
+  const verdictPath2 = herdr.verdictPathOf(reviewPane2);
   fs.writeFileSync(verdictPath2, "APPROVED: yes\n");
-  herdr.workerExits(p, 0);
+  herdr.workerDone(reviewPane2);
   r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.deepEqual(eventTypes(r), ["review_completed", "ticket_integrated", "run_completed"]);
 });
@@ -373,7 +389,7 @@ test("cleanup removes integrated worktrees and branches", async () => {
   const p = herdr.panes.keys().next().value as string;
   const worktree = herdr.panes.get(p)!.cwd;
   herdr.workerCommits(p);
-  herdr.workerExits(p, 0);
+  herdr.workerDone(p);
   await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr); // integrates TKT-001, starts TKT-002
 
   // Cancel the run so no more workers matter, then clean up.
@@ -404,7 +420,7 @@ test("merge conflict asks the human via waiting_human", async () => {
   const cwd = herdr.panes.get(p)!.cwd;
   fs.writeFileSync(path.join(cwd, "conflict.txt"), "from worker\n");
   sh("git add -A && git commit -m 'worker version'", cwd);
-  herdr.workerExits(p, 0);
+  herdr.workerDone(p);
 
   const r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.ok(eventTypes(r).includes("waiting_human"));

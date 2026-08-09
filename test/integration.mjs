@@ -27,7 +27,7 @@ const repo =
     return dir;
   })();
 
-const deps = { herdr: herdrAdapter };
+const deps = { herdr: herdrAdapter, log: (m) => console.log("[dispatch]", m) };
 const tickets = JSON.stringify([
   { id: "INT-001", title: "Add greeting module", description: "Create src/greet.ts exporting a function greet(name: string): string that returns `Hello, ${name}!`. Add it to the repo and commit.", dependsOn: [] },
 ]);
