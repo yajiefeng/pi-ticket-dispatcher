@@ -119,3 +119,19 @@ src/types.ts                          # ticket/state/event types
 - No rebasing of ticket branches onto a moved base before merging; conflicts
   surface at integration time as `waiting_human`.
 - The state directory is added to the target repo's `.gitignore` on `start`.
+
+## Herdr version compatibility
+
+Herdr **0.8+** changed `herdr agent start` from "launch a process"
+(`--cwd/--workspace/--no-focus`, 0.7.x) to "declare an existing pane as an
+agent" (`--kind KIND --pane ID`), and it shell-quotes all arguments, so worker
+scripts can no longer be launched through it. The dispatcher detects the herdr
+version automatically:
+
+- **0.7.x** — workers are launched with `agent start`; Herdr auto-closes the
+  pane when the worker exits, so crashes are detected by a vanished pane.
+- **0.8+** — workers are launched via `pane split --cwd` (or an existing
+  ticket workspace's pane) + `pane run <script>`. The pane's shell stays
+  alive after the script exits, so completion is detected purely via the
+  exit-code file and crash detection is not available on this path; worker
+  panes are closed by `cleanup`.
