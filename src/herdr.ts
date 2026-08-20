@@ -34,6 +34,9 @@ export interface HerdrAdapter {
     argv: string[];
     cwd?: string;
     workspaceId?: string;
+    tabId?: string;
+    /** Explicit pane (0.8+ path: the tab's root pane). */
+    paneId?: string;
     focus?: boolean;
   }): StartAgentResult;
   /** True if the pane still exists in Herdr. */
@@ -50,10 +53,14 @@ export interface HerdrAdapter {
   waitAgentIdle(target: string, timeoutMs: number): boolean;
   /** Current agent status ("idle" | "working" | ...) or undefined if unknown/gone. */
   agentStatus(target: string): string | undefined;
-  /** Create a dedicated workspace for a ticket's worker. */
+  /** Create a dedicated workspace for a ticket's worker (legacy layout). */
   createWorkspace(opts: { label: string; cwd?: string }): { workspaceId: string };
   /** Close a workspace we created. Errors are swallowed. */
   closeWorkspace(workspaceId: string): void;
+  /** Create a tab (with its root pane) in the dispatcher's workspace for a ticket. */
+  createTab(opts: { label: string; cwd?: string }): { tabId: string; paneId: string };
+  /** Close a tab we created. Errors are swallowed. */
+  closeTab(tabId: string): void;
 }
 
 /** Parse the herdr CLI JSON envelope: {"id":..., "result": {...}}. */
@@ -137,12 +144,19 @@ function startAgentV8(opts: {
   name: string;
   cwd?: string;
   workspaceId?: string;
+  tabId?: string;
+  paneId?: string;
 }): StartAgentResult {
-  const { name, cwd, workspaceId } = opts;
+  const { name, cwd, workspaceId, tabId, paneId } = opts;
 
-  let paneId: string;
+  // The 0.8 `agent start` targets an existing pane. With the per-ticket tab
+  // layout the tab's root pane is provided by the dispatcher; otherwise fall
+  // back to pane list (workspace) or pane split (cwd).
+  let targetPaneId = paneId;
   let wsId = workspaceId;
-  if (wsId) {
+  if (targetPaneId) {
+    // nothing more to resolve
+  } else if (wsId) {
     const listed = herdrJson<{ panes: Array<{ pane_id: string }> }>([
       "pane",
       "list",
@@ -153,7 +167,7 @@ function startAgentV8(opts: {
     if (panes.length === 0) {
       throw new Error(`startAgent (v8): no pane in workspace ${wsId}`);
     }
-    paneId = panes[0].pane_id;
+    targetPaneId = panes[0].pane_id;
   } else if (cwd) {
     const split = herdrJson<{ pane: { pane_id: string; workspace_id: string } }>([
       "pane",
@@ -163,10 +177,13 @@ function startAgentV8(opts: {
       "--cwd",
       cwd,
     ]);
-    paneId = split.pane.pane_id;
+    targetPaneId = split.pane.pane_id;
     wsId = split.pane.workspace_id;
   } else {
     throw new Error("startAgent (v8) requires a workspaceId or cwd");
+  }
+  if (!targetPaneId) {
+    throw new Error("startAgent (v8): could not resolve a target pane");
   }
 
   const result = herdrJson<{
@@ -177,7 +194,7 @@ function startAgentV8(opts: {
       terminal_id: string;
       name: string;
     };
-  }>(["agent", "start", name, "--kind", "pi", "--pane", paneId]);
+  }>(["agent", "start", name, "--kind", "pi", "--pane", targetPaneId]);
 
   return {
     paneId: result.agent.pane_id,
@@ -190,14 +207,15 @@ function startAgentV8(opts: {
 
 /** Real adapter backed by the herdr CLI. */
 export const herdrAdapter: HerdrAdapter = {
-  startAgent({ name, argv, cwd, workspaceId, focus }) {
+  startAgent({ name, argv, cwd, workspaceId, tabId, paneId, focus }) {
     if (usesNewAgentApi()) {
-      return startAgentV8({ name, cwd, workspaceId });
+      return startAgentV8({ name, cwd, workspaceId, tabId, paneId });
     }
 
     const args = ["agent", "start", name];
     if (cwd) args.push("--cwd", cwd);
     if (workspaceId) args.push("--workspace", workspaceId);
+    if (tabId) args.push("--tab", tabId);
     args.push(focus === false ? "--no-focus" : "--focus");
     args.push("--");
     args.push(...argv);
@@ -305,6 +323,21 @@ export const herdrAdapter: HerdrAdapter = {
   closeWorkspace(workspaceId) {
     if (!workspaceId) return;
     herdrMaybe(["workspace", "close", workspaceId]);
+  },
+
+  createTab({ label, cwd }) {
+    const args = ["tab", "create", "--label", label];
+    if (cwd) args.push("--cwd", cwd);
+    const result = herdrJson<{
+      tab: { tab_id: string };
+      root_pane: { pane_id: string };
+    }>(args);
+    return { tabId: result.tab.tab_id, paneId: result.root_pane.pane_id };
+  },
+
+  closeTab(tabId) {
+    if (!tabId) return;
+    herdrMaybe(["tab", "close", tabId]);
   },
 };
 

@@ -13,17 +13,18 @@ tool that owns all state transitions, idempotency, and crash recovery.
 ```text
 Herdr
 ├─ Dispatcher workspace
-│  └─ Dispatcher Pi
-│     ├─ /skill:implement-tickets
-│     └─ ticket_dispatch tool
-├─ Ticket 01 worktree workspace   ── worker: pi -p (one-shot implementer)
-└─ Ticket 02 worktree workspace   ── worker: pi -p (implementer + optional reviewer)
+│  ├─ Dispatcher Pi
+│  │  ├─ /skill:implement-tickets
+│  │  └─ ticket_dispatch tool
+│  ├─ Tab "ticket 01" ── interactive pi worker
+│  └─ Tab "ticket 02" ── interactive pi worker (optional reviewer)
 ```
 
 - **No daemon.** The extension registers one tool and does nothing at load
   time. All side effects happen inside `ticket_dispatch` calls.
 - **Workers are interactive `pi` processes** launched by Herdr into per-ticket
-  git worktrees (each in its own Herdr workspace). You can watch them work and
+  git worktrees, each in its own tab (`ticket <id>`) inside the Dispatcher's
+  workspace — the workspace list stays clean. You can watch them work and
   see their Herdr `working`/`idle` status; each round is submitted as a
   single-line instruction carrying a unique completion marker
   (`DONE-<ID>-<round>`) that the worker replies with when done.
@@ -132,8 +133,8 @@ version automatically:
 
 - **0.7.x** — workers are launched with `agent start <name> --cwd <worktree> -- pi`.
 - **0.8+** — `agent start` changed to `--kind KIND --pane ID`; the dispatcher
-  creates a pane (`pane split --cwd` or the ticket workspace's pane) and
-  declares it as a pi agent, which starts the same interactive worker.
+  uses the ticket tab's root pane and declares it as a pi agent, which starts
+  the same interactive worker.
 
 Either way the worker is a real interactive `pi`, so Herdr reports
 `working`/`idle` and the TUI is visible. Completion is always detected by the

@@ -45,6 +45,8 @@ export interface WorkerInfo {
   round?: number;
   /** The Herdr workspace this worker pane lives in, if the dispatcher created one. */
   workspaceId?: string;
+  /** The Herdr tab this worker pane lives in (per-ticket tab layout). */
+  tabId?: string;
   /** When the current task instruction was last sent (for re-sending lost instructions). */
   instructionSentAt?: number;
 }
@@ -65,8 +67,10 @@ export interface TicketState {
   status: TicketStatus;
   branchName: string;
   worktreePath?: string;
-  /** The Herdr workspace dedicated to this ticket's workers, if the dispatcher created one. */
+  /** The Herdr workspace dedicated to this ticket's workers (legacy layout, pre-tab). */
   workspaceId?: string;
+  /** The Herdr tab in the dispatcher's workspace dedicated to this ticket (current layout). */
+  tabId?: string;
   implementer?: WorkerInfo;
   reviewer?: WorkerInfo;
   attempts: AttemptRecord[];

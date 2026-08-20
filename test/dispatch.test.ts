@@ -45,13 +45,15 @@ class FakeHerdr implements HerdrAdapter {
   private paneSeq = 0;
   private wsSeq = 0;
 
-  startAgent(opts: { name: string; argv: string[]; cwd?: string; workspaceId?: string; focus?: boolean }) {
-    const paneId = `p${++this.paneSeq}`;
+  startAgent(opts: { name: string; argv: string[]; cwd?: string; workspaceId?: string; tabId?: string; paneId?: string; focus?: boolean }) {
+    // With the per-ticket tab layout the dispatcher passes the tab's root
+    // pane; record the agent on that same pane.
+    const paneId = opts.paneId ?? `p${++this.paneSeq}`;
     this.panes.set(paneId, { name: opts.name, cwd: opts.cwd ?? "", argv: opts.argv, workspaceId: opts.workspaceId, content: "" });
     return {
       paneId,
       workspaceId: opts.workspaceId ?? `w${++this.wsSeq}`,
-      tabId: `${paneId}:t`,
+      tabId: opts.tabId ?? `${paneId}:t`,
       terminalId: `term_${paneId}`,
       name: opts.name,
     };
@@ -84,6 +86,20 @@ class FakeHerdr implements HerdrAdapter {
   }
   closeWorkspace(workspaceId: string): void {
     this.workspaces.delete(workspaceId);
+  }
+  tabs = new Map<string, { label: string; paneId: string }>();
+  private tabSeq = 0;
+  createTab(opts: { label: string; cwd?: string }) {
+    const tabId = `t${++this.tabSeq}`;
+    const paneId = `p${++this.paneSeq}`;
+    this.tabs.set(tabId, { label: opts.label, paneId });
+    this.panes.set(paneId, { name: opts.label, cwd: opts.cwd ?? "", argv: [], content: "" });
+    return { tabId, paneId };
+  }
+  closeTab(tabId: string): void {
+    const tab = this.tabs.get(tabId);
+    if (tab) this.panes.delete(tab.paneId);
+    this.tabs.delete(tabId);
   }
 
   // -- test helpers ---------------------------------------------------------

@@ -688,16 +688,20 @@ async function launchWorkerFor(
   }
 
   const agentName = workerAgentName(id, round, isReviewer ? "review" : "impl");
-  const workspaceLabel = `ticket ${id}`;
+  const tabLabel = `ticket ${id}`;
 
-  // Reuse the ticket's existing Herdr workspace; create one only if needed.
-  let workspaceId = ticket.workspaceId;
-  if (!workspaceId) {
+  // Each ticket gets its own tab in the dispatcher's workspace (keeps the
+  // workspace list clean). Reuse the ticket's tab if one was already created.
+  let tabId = ticket.tabId;
+  let tabPaneId: string | undefined;
+  if (!tabId) {
     try {
-      workspaceId = deps.herdr.createWorkspace({ label: workspaceLabel, cwd: worktree }).workspaceId;
+      const tab = deps.herdr.createTab({ label: tabLabel, cwd: worktree });
+      tabId = tab.tabId;
+      tabPaneId = tab.paneId;
     } catch (err) {
-      workspaceId = undefined;
-      deps.log?.(`workspace create failed for ${id}: ${(err as Error).message}; using default workspace`);
+      tabId = undefined;
+      deps.log?.(`tab create failed for ${id}: ${(err as Error).message}; using default tab`);
     }
   }
 
@@ -707,7 +711,9 @@ async function launchWorkerFor(
       name: agentName,
       argv: ["pi"],
       cwd: worktree,
-      workspaceId,
+      workspaceId: ticket.workspaceId,
+      tabId,
+      paneId: tabPaneId,
       focus: false,
     });
   } catch (err) {
@@ -734,6 +740,7 @@ async function launchWorkerFor(
     status: "starting",
     round,
     workspaceId: started.workspaceId,
+    tabId,
   };
 
   // Persist the worker immediately (crash recovery), then wait for the
@@ -742,7 +749,8 @@ async function launchWorkerFor(
     ...ticket,
     round,
     worktreePath: worktree,
-    workspaceId: workspaceId ?? ticket.workspaceId,
+    workspaceId: ticket.workspaceId,
+    tabId: tabId ?? ticket.tabId,
   };
   if (isReviewer) {
     updated.reviewer = workerInfo;
@@ -1207,6 +1215,8 @@ export function dispatchCleanup(
     for (const worker of [ts.implementer, ts.reviewer]) {
       if (worker?.paneId) depsIn.herdr.closePane(worker.paneId);
     }
+    if (ts.tabId) depsIn.herdr.closeTab(ts.tabId);
+    // Legacy layout (pre-tab): close the per-ticket workspace if one exists.
     if (ts.workspaceId) depsIn.herdr.closeWorkspace(ts.workspaceId);
     if (ts.worktreePath) {
       git.removeWorktree(state.targetRepo, ts.worktreePath);
