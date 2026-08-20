@@ -59,7 +59,8 @@ ready tickets, launches new workers up to `maxParallel`, and waits up to
 | `ticket_integrated` | Branch merged into base, dependents unlocked | keep advancing |
 | `ticket_failed` | Ticket exhausted its attempts | note it; other tickets continue |
 | `state_unchanged` | No state change within the wait window | keep advancing; workers are still running |
-| `waiting_human` | A decision is required | stop and ask the user |
+| `conflict_resolved` | A merge/rebase conflict was auto-resolved | keep advancing |
+| `waiting_human` | Rare: repeated merge conflicts, a repeatedly stalling worker, or launch failure | stop and ask the user |
 | `run_completed` | All tickets terminal | proceed to step 4 |
 | `run_failed` | Catastrophic run failure | report and stop |
 
@@ -113,8 +114,11 @@ If the Dispatcher Pi restarted mid-run:
 - Workers are interactive `pi` processes: you can watch them work (and their
   Herdr working/idle status) in the Herdr UI. Each worker round is detected by
   a unique completion marker (DONE-<ID>-<round>) the worker replies with.
-- If a worker runs longer than 3 hours without completing, the run pauses
-  with `waiting_human` (retry_launch / fail_ticket / cancel_run).
+- Workers that are actively working are never timed out. A worker that sits
+  idle for 30 minutes without completing is auto-restarted (twice); if it keeps
+  stalling, the run pauses with `waiting_human`.
+- Merge/rebase conflicts are auto-resolved (rebase, then a conflict worker);
+  `waiting_human` only appears for genuinely unresolvable situations.
 - Never launch workers yourself; `advance` handles parallelism and capacity.
 - Keep calling `advance` when you see `state_unchanged` — that is the
   expected signal while workers run. Use a small `waitMs` (e.g. 60_000) so

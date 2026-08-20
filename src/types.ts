@@ -12,6 +12,7 @@ export type TicketStatus =
   | "implementing"  // worker is implementing
   | "reviewing"     // reviewer is reviewing (optional)
   | "fixing"        // worker is addressing review feedback
+  | "resolving"     // a worker is resolving merge/rebase conflicts for this ticket
   | "ready"         // implementation approved, ready to integrate
   | "integrated"    // merged into main / base branch
   | "failed"        // exceeded retry limits or human cancelled
@@ -49,6 +50,8 @@ export interface WorkerInfo {
   tabId?: string;
   /** When the current task instruction was last sent (for re-sending lost instructions). */
   instructionSentAt?: number;
+  /** Last time the agent reported a non-idle (working) status. */
+  lastActiveAt?: number;
 }
 
 /** Attempt record for a single implementation or review attempt. */
@@ -87,6 +90,10 @@ export interface TicketState {
   lastCommit?: string;
   /** Human-readable error if status is failed. */
   errorMessage?: string;
+  /** How many merge-conflict resolution attempts have been made (bounded). */
+  conflictAttempts?: number;
+  /** How many consecutive idle-stalls this ticket's worker has had (auto-restarts). */
+  stallCount?: number;
   updatedAt: number;
   createdAt: number;
 }
@@ -134,6 +141,7 @@ export type DispatchAction =
 export type DispatchEvent =
   | { type: "worker_started"; ticketId: string; workerName: string }
   | { type: "worker_retrying"; ticketId: string; round: number; reason: string }
+  | { type: "conflict_resolved"; ticketId: string }
   | { type: "implementation_ready"; ticketId: string; commitSha: string }
   | { type: "reviewer_started"; ticketId: string }
   | { type: "review_completed"; ticketId: string; approved: boolean; feedback?: string }

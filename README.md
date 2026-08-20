@@ -88,8 +88,13 @@ configured Pi provider for the workers.
   exit file is detected and relaunched, counting as a failed attempt.
 - **Bounded fix loops** — `maxAttempts` caps implement + fix rounds; reviewers
   are capped the same way.
-- **Safe integration** — merges are `--no-ff` into the base branch; conflicts
-  pause the run with a `waiting_human` event instead of guessing.
+- **Safe integration** — merges are `--no-ff` into the base branch. Conflicts
+  are auto-resolved: the ticket branch is rebased onto the base, and a worker
+  resolves any remaining rebase conflicts; only after repeated failures does
+  the run pause with `waiting_human`.
+- **Stall detection** — a worker that is actively working is never timed out;
+  a worker that sits idle without completing for 30 minutes is auto-restarted
+  (twice), then the run pauses with `waiting_human`.
 
 ## Development
 
@@ -119,9 +124,10 @@ src/types.ts                          # ticket/state/event types
 - Workers use whatever provider/model the Dispatcher Pi is configured with.
 - A worker that commits nothing, exits non-zero, or leaves a dirty tree counts
   as a failed attempt (strict; retry/fail per `maxAttempts`).
-- No rebasing of ticket branches onto a moved base before merging; conflicts
-  surface at integration time as `waiting_human`.
 - The state directory is added to the target repo's `.gitignore` on `start`.
+- `waiting_human` is now reserved for genuinely unresolvable situations:
+  repeated merge conflicts, a worker that keeps stalling idle, or a worker
+  that fails to launch.
 
 ## Herdr version compatibility
 

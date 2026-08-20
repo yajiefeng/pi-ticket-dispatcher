@@ -18,11 +18,16 @@ export interface GitResult {
 }
 
 /** Run a git command in the given directory. No shell: args are passed verbatim. */
-export function gitRun(cwd: string, args: string[]): GitResult {
+export function gitRun(
+  cwd: string,
+  args: string[],
+  env?: Record<string, string>
+): GitResult {
   const result = spawnSync("git", args, {
     cwd,
     encoding: "utf-8",
     stdio: ["pipe", "pipe", "pipe"],
+    env: env ? { ...process.env, ...env } : undefined,
   });
   if (result.error) {
     return {
@@ -202,6 +207,37 @@ export function hasNewCommits(worktreePath: string, baseBranch: string): boolean
     return result2.exitCode === 0 && parseInt(result2.stdout, 10) > 0;
   }
   return parseInt(result.stdout, 10) > 0;
+}
+
+/**
+ * Rebase the worktree's current branch onto the base branch.
+ * Returns true when the rebase left conflicts for a worker to resolve.
+ */
+export function rebaseOnto(worktreePath: string, baseBranch: string): { conflicted: boolean; error?: string } {
+  const result = gitRun(worktreePath, ["rebase", baseBranch]);
+  return {
+    conflicted: result.exitCode !== 0,
+    error: result.exitCode !== 0 ? result.stderr || result.stdout : undefined,
+  };
+}
+
+/** True while a rebase is in progress in the worktree (conflict state). */
+export function isRebaseInProgress(worktreePath: string): boolean {
+  const result = gitRun(worktreePath, ["status"]);
+  return /rebase in progress|You are currently rebasing/i.test(result.stdout);
+}
+
+/**
+ * Rebase --continue with a non-interactive editor (a worker has resolved the
+ * conflicts and staged them). Returns true when the rebase is now complete.
+ */
+export function continueRebase(worktreePath: string): boolean {
+  const result = gitRun(
+    worktreePath,
+    ["rebase", "--continue"],
+    { GIT_EDITOR: "true" }
+  );
+  return result.exitCode === 0 && !isRebaseInProgress(worktreePath);
 }
 
 /**

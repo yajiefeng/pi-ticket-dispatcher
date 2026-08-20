@@ -90,10 +90,19 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_WAIT_MS = 60_000;
 const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 1_000;
-/** Max time one worker round may run before we ask the human. */
-const WORKER_TIMEOUT_MS = 3 * 60 * 60 * 1_000; // 3 hours
 /** Re-send a worker's instruction if it has been idle this long without the marker. */
 const REINSTRUCT_INTERVAL_MS = 90_000;
+/** If a worker reports non-working for this long without the marker, it is stalled: auto-restart it. */
+const IDLE_TIMEOUT_MS = 30 * 60_000;
+/** Auto-restarts per worker before pausing for a human. */
+const MAX_WORKER_RESTARTS = 2;
+/** Conflict-resolution attempts per ticket before pausing for a human. */
+const MAX_CONFLICT_ATTEMPTS = 2;
+/** Default instruction suffix for conflict-resolution rounds. */
+const CONFLICT_INSTRUCTION =
+  "You are resolving merge/rebase conflicts. Run git status to see conflicted files, " +
+  "resolve them, git add them, then run git rebase --continue (set GIT_EDITOR=true). " +
+  "Repeat until the rebase is done, then commit if needed.";
 
 export type ResolvedDeps = Required<Pick<DispatcherDeps, "now" | "sleep">> & DispatcherDeps;
 
@@ -204,7 +213,8 @@ function instructWorker(
       : buildImplementerPrompt({
           state,
           ticket,
-          feedback: opts?.reason ?? ticket.reviewFeedback,
+          feedback:
+            opts?.reason ?? (ticket.status === "resolving" ? CONFLICT_INSTRUCTION : ticket.reviewFeedback),
         });
   fs.writeFileSync(promptPath, prompt, "utf-8");
 
@@ -252,7 +262,7 @@ async function waitForWorkerIdle(
 function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps): void {
   for (const id of activeTicketsToProcess(state, ctx.only)) {
     const ticket = state.tickets[id];
-    if (!["implementing", "reviewing", "fixing"].includes(ticket.status)) continue;
+    if (!["implementing", "reviewing", "fixing", "resolving"].includes(ticket.status)) continue;
     const worker = activeWorker(ticket);
     if (!worker?.paneId) continue;
     const round = worker.round ?? ticket.round;
@@ -275,12 +285,21 @@ function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps)
       .split("\n")
       .some((line) => line.trim() === marker);
     if (!markerSeen) {
-      // The instruction may have been lost (worker not ready when sent, or a
-      // transient herdr send failure). If the worker is idle and enough time
-      // passed since the last send, re-send it.
       const status = deps.herdr.agentStatus(worker.agentName);
+
+      // A working agent is making progress: keep waiting, no timeout.
+      if (status === "working") {
+        if (worker.lastActiveAt !== deps.now()) {
+          worker.lastActiveAt = deps.now();
+          ctx.changed = true;
+        }
+        continue;
+      }
+
+      // Idle / unknown / done with no marker: the instruction may have been
+      // lost (worker not ready when sent). Re-send it periodically.
       const lastSent = worker.instructionSentAt ?? worker.startedAt;
-      if (status !== "working" && deps.now() - lastSent > REINSTRUCT_INTERVAL_MS) {
+      if (deps.now() - lastSent > REINSTRUCT_INTERVAL_MS) {
         instructWorker(
           state,
           ticket,
@@ -291,29 +310,82 @@ function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps)
         ctx.changed = true;
         continue;
       }
-      // Still running. Timeout?
-      if (deps.now() - worker.startedAt > WORKER_TIMEOUT_MS) {
-        state.runStatus = "waiting_human";
-        state.statusMessage = `worker ${worker.agentName} (ticket ${id}) ran for over ${Math.round(WORKER_TIMEOUT_MS / 60_000)} minutes without completing`;
-        ctx.events.push({
-          type: "waiting_human",
-          reason: `worker ${worker.agentName} for ticket ${id} timed out without completing; resolve with retry_launch (restart the worker), fail_ticket, or cancel_run`,
-          ticketId: id,
-          options: ["retry_launch", "fail_ticket", "cancel_run"],
-        });
-        ctx.changed = true;
-        return; // stop the cascade; ask the human
+
+      // Still idle and no progress for a long stretch: the worker is stalled.
+      // Auto-restart it; only ask the human after repeated stalls.
+      const lastActive = worker.lastActiveAt ?? worker.startedAt;
+      if (deps.now() - lastActive > IDLE_TIMEOUT_MS) {
+        restartStalledWorker(state, ticket, worker, ctx, deps);
+        continue;
       }
-      continue; // still working
+      continue; // still running
     }
 
     // Marker found: the worker finished its round.
     if (ticket.status === "reviewing") {
       handleReviewerDone(state, ticket, worker, round, ctx, deps);
+    } else if (ticket.status === "resolving") {
+      handleConflictWorkerDone(state, ticket, worker, round, ctx, deps);
     } else {
       handleImplementerDone(state, ticket, worker, round, ctx, deps);
     }
   }
+}
+
+/**
+ * A worker that stayed non-working past IDLE_TIMEOUT_MS without completing is
+ * stalled: close its pane and relaunch it (bounded by MAX_WORKER_RESTARTS and
+ * maxAttempts). Only after repeated stalls do we pause for a human.
+ */
+function restartStalledWorker(
+  state: DispatchState,
+  ticket: TicketState,
+  worker: WorkerInfo,
+  ctx: ReapContext,
+  deps: ResolvedDeps
+): void {
+  const id = ticket.ticket.id;
+  const stallCount = (ticket.stallCount ?? 0) + 1;
+  deps.herdr.closePane(worker.paneId);
+
+  if (stallCount <= MAX_WORKER_RESTARTS && ticket.attemptCount < ticket.maxAttempts) {
+    const updated = addAttempt(ticket, {
+      type: ticket.status === "reviewing" ? ("review" as const) : ticket.status === "fixing" ? ("fix" as const) : ("implement" as const),
+      startedAt: worker.startedAt,
+      endedAt: Date.now(),
+      outcome: "failure",
+      notes: `worker stalled idle for ${Math.round(IDLE_TIMEOUT_MS / 60_000)}min without completing; restarted (${stallCount}/${MAX_WORKER_RESTARTS})`,
+      workerName: worker.agentName,
+    });
+    const nextRound = updated.round + 1;
+    if (ticket.status === "reviewing") {
+      updated.reviewer = undefined; // launchWorkers relaunches
+    } else {
+      updated.implementer = undefined;
+    }
+    updated.stallCount = stallCount;
+    updated.round = nextRound;
+    state.tickets[id] = updated;
+    ctx.events.push({
+      type: "worker_retrying",
+      ticketId: id,
+      round: nextRound,
+      reason: `worker ${worker.agentName} stalled idle and was restarted (${stallCount}/${MAX_WORKER_RESTARTS})`,
+    });
+    ctx.changed = true;
+    return;
+  }
+
+  // Restarts exhausted: pause the run and ask the human.
+  state.runStatus = "waiting_human";
+  state.statusMessage = `worker ${worker.agentName} (ticket ${id}) stalled ${stallCount} times without completing`;
+  ctx.events.push({
+    type: "waiting_human",
+    reason: `worker ${worker.agentName} for ticket ${id} stalled idle repeatedly without completing; resolve with retry_launch (restart), fail_ticket, or cancel_run`,
+    ticketId: id,
+    options: ["retry_launch", "fail_ticket", "cancel_run"],
+  });
+  ctx.changed = true;
 }
 
 /** An implementer pane vanished mid-round: count it and relaunch (or fail). */
@@ -427,6 +499,83 @@ function handleImplementerDone(
       ? "you left uncommitted changes in the worktree"
       : "you made no commits";
   instructImplementerFix(state, ticket, worker, reason, ctx, deps);
+}
+
+/**
+ * A conflict-resolution worker finished its round. Verify the rebase is
+ * complete; if so the ticket goes back to ready and integrateReady retries.
+ */
+function handleConflictWorkerDone(
+  state: DispatchState,
+  ticket: TicketState,
+  worker: WorkerInfo,
+  round: number,
+  ctx: ReapContext,
+  deps: ResolvedDeps
+): void {
+  const id = ticket.ticket.id;
+  const worktree = ticket.worktreePath ?? worker.worktreePath;
+
+  if (worktree && !git.isRebaseInProgress(worktree) && git.hasNewCommits(worktree, state.baseBranch)) {
+    // Conflicts resolved: rebase finished, branch has commits. Retry integration.
+    const updated = addAttempt(ticket, {
+      type: "fix",
+      startedAt: worker.startedAt,
+      endedAt: Date.now(),
+      outcome: "success",
+      notes: "resolved merge conflicts",
+      workerName: worker.agentName,
+    });
+    updated.status = "ready";
+    state.tickets[id] = updated;
+    ctx.events.push({ type: "conflict_resolved", ticketId: id });
+    ctx.changed = true;
+    return;
+  }
+
+  // The worker did not finish the rebase. Count and re-instruct (bounded).
+  const conflictAttempts = (ticket.conflictAttempts ?? 0) + 1;
+  const updated = addAttempt(ticket, {
+    type: "fix",
+    startedAt: worker.startedAt,
+    endedAt: Date.now(),
+    outcome: "failure",
+    notes: worktree && git.isRebaseInProgress(worktree)
+      ? "rebase still in progress after worker round"
+      : "conflict resolution produced no commits",
+    workerName: worker.agentName,
+  });
+  updated.conflictAttempts = conflictAttempts;
+
+  if (conflictAttempts > MAX_CONFLICT_ATTEMPTS) {
+    const failed = { ...updated, status: "failed" as const, errorMessage: "conflict resolution failed repeatedly" };
+    state.tickets[id] = failed;
+    ctx.events.push({
+      type: "ticket_failed",
+      ticketId: id,
+      reason: "could not auto-resolve merge conflicts",
+    });
+    ctx.changed = true;
+    return;
+  }
+
+  const nextRound = updated.round + 1;
+  const nextWorker: WorkerInfo = { ...worker, round: nextRound, startedAt: deps.now() };
+  updated.implementer = nextWorker;
+  updated.round = nextRound;
+  state.tickets[id] = updated;
+  instructWorker(state, updated, "implementer", nextWorker, deps, {
+    reason:
+      "You are resolving merge/rebase conflicts. Run git status to see conflicted files, resolve them, " +
+      "git add them, then run git rebase --continue (set GIT_EDITOR=true). Repeat until the rebase is done.",
+  });
+  ctx.events.push({
+    type: "worker_retrying",
+    ticketId: id,
+    round: nextRound,
+    reason: `conflict resolution attempt ${conflictAttempts}/${MAX_CONFLICT_ATTEMPTS} did not finish`,
+  });
+  ctx.changed = true;
 }
 
 /** Send a corrective instruction (new round, same pane) or fail the ticket. */
@@ -586,7 +735,7 @@ function applyUnblock(state: DispatchState, integratedTicketId: string): void {
   state.updatedAt = next.updatedAt;
 }
 
-function integrateReady(state: DispatchState, ctx: ReapContext, _deps: ResolvedDeps): void {
+function integrateReady(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps): void {
   for (const id of activeTicketsToProcess(state, ctx.only)) {
     const ticket = state.tickets[id];
     if (ticket.status !== "ready") continue;
@@ -608,17 +757,10 @@ function integrateReady(state: DispatchState, ctx: ReapContext, _deps: ResolvedD
         ticketId: id,
       });
     } catch (err) {
-      // Merge conflict: ask the human.
-      state.runStatus = "waiting_human";
-      state.statusMessage = `Merge conflict integrating ticket ${id} into ${state.baseBranch}`;
-      ctx.events.push({
-        type: "waiting_human",
-        reason: `merge conflict integrating ticket ${id} into ${state.baseBranch}; resolve with "fail_ticket" or "cancel_run"`,
-        ticketId: id,
-        options: ["fail_ticket", "cancel_run"],
-      });
-      ctx.changed = true;
-      return; // stop integrating further tickets until resolved
+      // Merge conflict: try to resolve it automatically (rebase, then a
+      // worker resolves any remaining conflicts) instead of asking the human.
+      handleMergeConflict(state, ticket, ctx, deps);
+      continue; // keep integrating other ready tickets
     }
 
     const integrated = { ...ticket, status: "integrated" as const, lastCommit: mergeSha };
@@ -627,6 +769,68 @@ function integrateReady(state: DispatchState, ctx: ReapContext, _deps: ResolvedD
     ctx.changed = true;
     applyUnblock(state, id);
   }
+}
+
+/**
+ * A merge into the base conflicted. Try, in order:
+ * 1. rebase the ticket branch onto the base (many conflicts vanish),
+ * 2. dispatch a worker to resolve any remaining rebase conflicts,
+ * 3. only after MAX_CONFLICT_ATTEMPTS pause for a human.
+ */
+function handleMergeConflict(
+  state: DispatchState,
+  ticket: TicketState,
+  ctx: ReapContext,
+  deps: ResolvedDeps
+): void {
+  const id = ticket.ticket.id;
+  const conflictAttempts = (ticket.conflictAttempts ?? 0) + 1;
+  const updated = { ...ticket, conflictAttempts } as TicketState;
+
+  if (conflictAttempts > MAX_CONFLICT_ATTEMPTS) {
+    state.tickets[id] = updated;
+    state.runStatus = "waiting_human";
+    state.statusMessage = `ticket ${id} conflicts with ${state.baseBranch} and could not be auto-resolved`;
+    ctx.events.push({
+      type: "waiting_human",
+      reason: `ticket ${id} still conflicts with ${state.baseBranch} after ${MAX_CONFLICT_ATTEMPTS} auto-resolve attempts; resolve with retry_launch (retry), fail_ticket, or cancel_run`,
+      ticketId: id,
+      options: ["retry_launch", "fail_ticket", "cancel_run"],
+    });
+    ctx.changed = true;
+    return;
+  }
+
+  // Rebase the ticket branch onto the current base.
+  const worktree = ticket.worktreePath;
+  if (!worktree) {
+    const failed = { ...updated, status: "failed" as const, errorMessage: "ready but worktree missing" };
+    state.tickets[id] = failed;
+    ctx.events.push({ type: "ticket_failed", ticketId: id, reason: "ticket ready but worktree missing" });
+    ctx.changed = true;
+    return;
+  }
+  const rebased = git.rebaseOnto(worktree, state.baseBranch);
+  if (!rebased.conflicted) {
+    // Rebase clean: go straight back to ready; the next cascade pass integrates.
+    updated.status = "ready";
+    state.tickets[id] = updated;
+    ctx.events.push({ type: "conflict_resolved", ticketId: id });
+    ctx.changed = true;
+    return;
+  }
+
+  // Rebase left conflicts: dispatch a worker to resolve them in the worktree.
+  updated.status = "resolving";
+  updated.implementer = undefined;
+  state.tickets[id] = updated;
+  ctx.events.push({
+    type: "worker_retrying",
+    ticketId: id,
+    round: updated.round + 1,
+    reason: `merge with ${state.baseBranch} conflicted; dispatch conflict-resolution worker (attempt ${conflictAttempts}/${MAX_CONFLICT_ATTEMPTS})`,
+  });
+  ctx.changed = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,7 +886,11 @@ async function launchWorkerFor(
   } else {
     fs.writeFileSync(
       promptFile(state, id, round),
-      buildImplementerPrompt({ state, ticket, feedback: ticket.reviewFeedback }),
+      buildImplementerPrompt({
+        state,
+        ticket,
+        feedback: ticket.status === "resolving" ? CONFLICT_INSTRUCTION : ticket.reviewFeedback,
+      }),
       "utf-8"
     );
   }
@@ -781,7 +989,7 @@ async function launchWorkerFor(
 
 async function launchWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps): Promise<void> {
   const running = Object.values(state.tickets).filter(
-    (ts) => ["implementing", "reviewing", "fixing"].includes(ts.status) && activeWorker(ts)?.paneId
+    (ts) => ["implementing", "reviewing", "fixing", "resolving"].includes(ts.status) && activeWorker(ts)?.paneId
   ).length;
   let capacity = state.maxParallel - running;
 
@@ -797,12 +1005,15 @@ async function launchWorkers(state: DispatchState, ctx: ReapContext, deps: Resol
     }
   }
 
-  // 2) Relaunch implementers for tickets whose worker was cleared (crash).
+  // 2) Relaunch implementers whose worker was cleared (crash / stall) and
+  //    launch conflict-resolution workers for tickets waiting on a rebase.
   for (const id of activeTicketsToProcess(state, ctx.only)) {
     if (capacity <= 0) return;
     const ticket = state.tickets[id];
     if (
-      (ticket.status === "implementing" || ticket.status === "fixing") &&
+      (ticket.status === "implementing" ||
+        ticket.status === "fixing" ||
+        ticket.status === "resolving") &&
       !ticket.implementer?.paneId
     ) {
       await launchWorkerFor(state, ticket, "implementer", ctx, deps);
@@ -833,7 +1044,7 @@ function summarize(state: DispatchState): Record<string, number> {
 
 function ticketRows(state: DispatchState): DispatchResult["tickets"] {
   return Object.values(state.tickets).map((ts) => {
-    const active = ["implementing", "reviewing", "fixing"].includes(ts.status);
+    const active = ["implementing", "reviewing", "fixing", "resolving"].includes(ts.status);
     const w = active ? activeWorker(ts) : undefined;
     return {
       id: ts.ticket.id,
@@ -936,7 +1147,7 @@ export async function dispatchAdvance(
   // Phase 2: nothing observable happened; wait for the next worker completion.
   if (events.length === 0 && now() < deadline && !deps.signal?.aborted) {
     const running = Object.values(state.tickets).some(
-      (ts) => ["implementing", "reviewing", "fixing"].includes(ts.status) && activeWorker(ts)?.paneId
+      (ts) => ["implementing", "reviewing", "fixing", "resolving"].includes(ts.status) && activeWorker(ts)?.paneId
     );
     if (running) {
       while (now() < deadline && !deps.signal?.aborted) {
@@ -965,7 +1176,7 @@ export async function dispatchAdvance(
     events.push({ type: "run_completed" });
   } else if (events.length === 0) {
     const idle = Object.values(state.tickets).some(
-      (ts) => ["implementing", "reviewing", "fixing"].includes(ts.status) && activeWorker(ts)?.paneId
+      (ts) => ["implementing", "reviewing", "fixing", "resolving"].includes(ts.status) && activeWorker(ts)?.paneId
     );
     events.push({
       type: "state_unchanged",
@@ -1114,7 +1325,7 @@ export function dispatchStatus(
 ): DispatchResult {
   const state = loadState(path.resolve(input.targetRepo));
   const running = Object.values(state.tickets)
-    .filter((ts) => ["implementing", "reviewing", "fixing"].includes(ts.status))
+    .filter((ts) => ["implementing", "reviewing", "fixing", "resolving"].includes(ts.status))
     .map((ts) => {
       const w = activeWorker(ts);
       return w
@@ -1144,7 +1355,7 @@ export function dispatchResolve(
     }
     // Close and clear every active worker so the next advance relaunches it.
     for (const ts of Object.values(state.tickets)) {
-      if (!["implementing", "reviewing", "fixing"].includes(ts.status)) continue;
+      if (!["implementing", "reviewing", "fixing", "resolving"].includes(ts.status)) continue;
       for (const worker of [ts.implementer, ts.reviewer]) {
         if (worker?.paneId) depsIn.herdr.closePane(worker.paneId);
       }

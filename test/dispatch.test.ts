@@ -423,7 +423,7 @@ test("cleanup removes integrated worktrees and branches", async () => {
   assert.ok(!branches.includes("ticket/tkt-001-"), "branch should be deleted");
 });
 
-test("merge conflict asks the human via waiting_human", async () => {
+test("merge conflict is auto-resolved by a conflict worker, then integrated", async () => {
   const repo = makeGitRepo();
   // Seed a file both sides will modify.
   fs.writeFileSync(path.join(repo, "conflict.txt"), "base\n");
@@ -437,14 +437,68 @@ test("merge conflict asks the human via waiting_human", async () => {
   fs.writeFileSync(path.join(repo, "conflict.txt"), "from main v2\n");
   sh("git add -A && git commit -m 'main moves on'", repo);
 
-  const p = herdr.panes.keys().next().value as string;
+  let p = herdr.panes.keys().next().value as string;
   const cwd = herdr.panes.get(p)!.cwd;
   fs.writeFileSync(path.join(cwd, "conflict.txt"), "from worker\n");
   sh("git add -A && git commit -m 'worker version'", cwd);
   herdr.workerDone(p);
 
-  const r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
-  assert.ok(eventTypes(r).includes("waiting_human"));
+  // Advance: ready -> merge conflicts -> rebase conflicts -> a conflict
+  // resolution worker is dispatched (NOT waiting_human).
+  let r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.ok(eventTypes(r).includes("implementation_ready"));
+  assert.ok(eventTypes(r).includes("worker_retrying"));
+  assert.ok(!eventTypes(r).includes("waiting_human"), "no waiting_human for a resolvable conflict");
+  const resolving = r.tickets.find((t) => t.id === "X")!;
+  assert.equal(resolving.status, "resolving");
+
+  // The conflict worker resolves the rebase conflict in the worktree.
+  p = [...herdr.panes.keys()].pop() as string;
+  const wt = herdr.panes.get(p)!.cwd;
+  fs.writeFileSync(path.join(wt, "conflict.txt"), "merged\n");
+  sh("git add conflict.txt", wt);
+  sh("GIT_EDITOR=true git rebase --continue", wt);
+  herdr.workerDone(p);
+
+  r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.ok(eventTypes(r).includes("conflict_resolved"));
+  assert.ok(eventTypes(r).includes("ticket_integrated"));
+  assert.equal(r.summary["integrated"], 1);
+  const merged = fs.readFileSync(path.join(repo, "conflict.txt"), "utf-8");
+  assert.equal(merged, "merged\n");
+});
+
+test("stalled idle worker is auto-restarted, then pauses for a human", async () => {
+  const repo = makeGitRepo();
+  const herdr = new FakeHerdr();
+  await run({ action: "start", targetRepo: repo, ticketsSource: JSON.stringify([{ id: "X", title: "X", description: "", dependsOn: [] }]), maxAttempts: 5 }, herdr);
+  await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+
+  // Worker never completes and stays idle: fake the idle-stall signal by
+  // making the recorded last active time old.
+  const statePath = path.join(repo, ".pi-ticket-dispatcher", "state.json");
+  const age = (ms: number) => {
+    const st = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    st.tickets.X.implementer.lastActiveAt = Date.now() - ms;
+    fs.writeFileSync(statePath, JSON.stringify(st), "utf-8");
+  };
+
+  // First stall -> auto restart (worker_retrying), new worker launched.
+  age(40 * 60_000);
+  let r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.ok(eventTypes(r).includes("worker_retrying"), JSON.stringify(r.events));
+  assert.equal(herdr.panes.size, 1, "a fresh worker pane should be launched");
+  assert.equal(r.tickets[0].attempts, 1);
+
+  // Second stall -> restart again.
+  age(40 * 60_000);
+  r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.ok(eventTypes(r).includes("worker_retrying"));
+
+  // Third stall (restarts exhausted) -> waiting_human.
+  age(40 * 60_000);
+  r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.ok(eventTypes(r).includes("waiting_human"), JSON.stringify(r.events));
   assert.equal(r.runStatus, "waiting_human");
 });
 

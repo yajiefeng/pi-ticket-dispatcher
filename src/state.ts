@@ -182,7 +182,8 @@ const VALID_TRANSITIONS: Record<TicketStatus, TicketStatus[]> = {
   implementing: ["ready", "fixing", "failed", "cancelled", "reviewing"],
   reviewing: ["ready", "fixing", "failed", "cancelled"],
   fixing: ["ready", "reviewing", "failed", "cancelled"],
-  ready: ["integrated", "cancelled", "failed"],
+  resolving: ["ready", "failed", "cancelled"],
+  ready: ["integrated", "resolving", "cancelled", "failed"],
   integrated: [], // terminal
   failed: [],     // terminal
   cancelled: [],  // terminal
@@ -263,7 +264,7 @@ export function setReviewer(
 /** Get all tickets currently in active (non-terminal, non-blocked, non-pending) state. */
 export function getActiveTickets(state: DispatchState): string[] {
   return Object.entries(state.tickets)
-    .filter(([, ts]) => ["implementing", "reviewing", "fixing"].includes(ts.status))
+    .filter(([, ts]) => ["implementing", "reviewing", "fixing", "resolving"].includes(ts.status))
     .map(([id]) => id);
 }
 
@@ -272,7 +273,7 @@ export function getActiveTickets(state: DispatchState): string[] {
 export function countRunningWorkers(state: DispatchState): number {
   let count = 0;
   for (const ts of Object.values(state.tickets)) {
-    if (!["implementing", "reviewing", "fixing"].includes(ts.status)) continue;
+    if (!["implementing", "reviewing", "fixing", "resolving"].includes(ts.status)) continue;
     const worker = ts.status === "reviewing" ? ts.reviewer : ts.implementer;
     if (worker?.paneId) count += 1;
   }
