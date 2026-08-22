@@ -77,7 +77,9 @@ class FakeHerdr implements HerdrAdapter {
   }
   /** Configurable agent status; default idle so re-sends are testable. */
   statuses = new Map<string, string>();
+  missingAgents = new Set<string>();
   agentStatus(target: string): string | undefined {
+    if (this.missingAgents.has(target)) return undefined;
     return this.statuses.get(target) ?? "idle";
   }
   createWorkspace(opts: { label: string; cwd?: string }) {
@@ -205,7 +207,7 @@ test("full run: start -> implement -> integrate -> unlock -> complete", async ()
   assert.deepEqual(eventTypes(r), ["worker_started"]);
   assert.equal((r.events[0] as { ticketId?: string }).ticketId, "TKT-001");
   const launchedPane = herdr.panes.keys().next().value as string;
-  assert.deepEqual(herdr.panes.get(launchedPane)!.argv, ["pi", "--approve"]);
+  assert.deepEqual(herdr.panes.get(launchedPane)!.argv, ["pi", "-ne", "--approve"]);
   assert.ok(herdr.lastInstruction(launchedPane).text.startsWith("/skill:implement"));
 
   // Worker completes with a clean commit.
@@ -323,6 +325,21 @@ test("dirty worktree counts as a failed attempt", async () => {
   herdr.workerDone(p);
   const r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.deepEqual(eventTypes(r), ["ticket_failed", "run_completed"]);
+});
+
+test("crashed agent is relaunched even when its pane still exists", async () => {
+  const repo = makeGitRepo();
+  const herdr = new FakeHerdr();
+  await run({ action: "start", targetRepo: repo, ticketsSource: JSON.stringify([{ id: "X", title: "X", description: "", dependsOn: [] }]) }, herdr);
+  await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  const firstPane = herdr.panes.keys().next().value as string;
+  const workerName = herdr.panes.get(firstPane)!.name;
+  herdr.missingAgents.add(workerName);
+
+  const result = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+
+  assert.ok(eventTypes(result).includes("worker_started"));
+  assert.equal(result.tickets[0].attempts, 1);
 });
 
 test("crashed worker (pane gone before completion) is relaunched", async () => {

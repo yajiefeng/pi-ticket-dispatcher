@@ -38,7 +38,7 @@ case "$1" in
   agent)
     case "$2" in
       start) echo "CALL:$*" >> "$FAKE_LOG"; echo '{"id":"cli:agent:start","result":{"agent":{"pane_id":"w9:p1","workspace_id":"w9","tab_id":"w9:t1","terminal_id":"term_x","name":"ticket-x-impl-1"},"argv":["pi"],"type":"agent_started"}}'; exit 0;;
-      wait)   echo '{"id":"cli:agent:wait","result":{"type":"ok"}}'; exit 0;;
+      wait)   echo "CALL:$*" >> "$FAKE_LOG"; echo '{"id":"cli:agent:wait","result":{"agent":{"agent_status":"idle"},"type":"ok"}}'; exit 0;;
       prompt) echo "CALL:$*" >> "$FAKE_LOG"; echo '{"id":"cli:agent:prompt","result":{"type":"ok"}}'; exit 0;;
     esac;;
   pane)
@@ -72,7 +72,7 @@ test("v8 adapter: existing workspace -> pane list + agent start --kind pi --pane
   installFakeHerdr();
   const result = herdrAdapter.startAgent({
     name: "ticket-x-impl-1",
-    argv: ["pi", "--approve"],
+    argv: ["pi", "-ne", "--approve"],
     cwd: "/tmp/wt",
     workspaceId: "w9",
     focus: false,
@@ -82,9 +82,17 @@ test("v8 adapter: existing workspace -> pane list + agent start --kind pi --pane
   const callsList = calls();
   assert.ok(callsList[0].includes("pane list --workspace w9"), callsList[0]);
   assert.ok(
-    callsList[1].includes("agent start ticket-x-impl-1 --kind pi --pane w9:p1 -- --approve"),
+    callsList[1].includes("agent start ticket-x-impl-1 --kind pi --pane w9:p1 -- -ne --approve"),
     callsList[1]
   );
+});
+
+test("v8 adapter: waits with the current --until flags", () => {
+  installFakeHerdr();
+  assert.equal(herdrAdapter.waitAgentIdle("ticket-x-impl-1", 5000), true);
+  assert.deepEqual(calls(), [
+    "CALL:agent wait ticket-x-impl-1 --until idle --until done --timeout 5000",
+  ]);
 });
 
 test("v8 adapter: submits prompts atomically with agent prompt", () => {

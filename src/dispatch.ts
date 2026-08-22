@@ -270,6 +270,13 @@ function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps)
     }
 
     const status = deps.herdr.agentStatus(worker.agentName);
+    if (status === undefined) {
+      // The terminal pane can survive a crashed Pi process. Treat a missing
+      // Herdr agent as a crash rather than repeatedly prompting a dead target.
+      if (ticket.status === "reviewing") restartReviewer(state, ticket, worker, ctx);
+      else crashImplementer(state, ticket, worker, ctx);
+      continue;
+    }
     const paneText = deps.herdr.readPane(worker.paneId, 120);
 
     if (status === "working") {
@@ -398,7 +405,7 @@ function crashImplementer(
     startedAt: worker.startedAt,
     endedAt: Date.now(),
     outcome: "failure",
-    notes: `worker ${worker.agentName} crashed (pane ${worker.paneId} gone)`,
+    notes: `worker ${worker.agentName} crashed (agent or pane disappeared)`,
     workerName: worker.agentName,
   });
   if (updated.attemptCount < updated.maxAttempts) {
@@ -412,7 +419,7 @@ function crashImplementer(
   ctx.events.push({
     type: "ticket_failed",
     ticketId: id,
-    reason: "worker crashed without completing",
+    reason: "worker agent or pane disappeared without completing",
   });
   ctx.changed = true;
 }
@@ -430,7 +437,7 @@ function restartReviewer(
     startedAt: worker.startedAt,
     endedAt: Date.now(),
     outcome: "failure",
-    notes: `reviewer ${worker.agentName} crashed (pane ${worker.paneId} gone)`,
+    notes: `reviewer ${worker.agentName} crashed (agent or pane disappeared)`,
     workerName: worker.agentName,
   });
   if (countAttempts(updated, "review") < ticket.maxAttempts) {
@@ -448,7 +455,7 @@ function restartReviewer(
   ctx.events.push({
     type: "ticket_failed",
     ticketId: id,
-    reason: "reviewer crashed without producing a verdict",
+    reason: "reviewer agent or pane disappeared without producing a verdict",
   });
   ctx.changed = true;
 }
@@ -939,7 +946,7 @@ async function launchWorkerFor(
       // Ticket worktrees are created from a repository the user explicitly
       // selected for this run. Approve project-local Pi resources for this
       // worker session so unattended dispatch is not blocked by the trust UI.
-      argv: ["pi", "--approve"],
+      argv: ["pi", "-ne", "--approve"],
       cwd: worktree,
       workspaceId: ticket.workspaceId,
       tabId,

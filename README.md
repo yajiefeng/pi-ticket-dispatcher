@@ -25,8 +25,9 @@ Herdr
 - **Workers are interactive `pi` processes** launched by Herdr into per-ticket
   git worktrees, each in its own tab (`ticket <id>`) inside the Dispatcher's
   workspace — the workspace list stays clean. Workers start Pi with
-  `--approve` because the user explicitly selected the target repository,
-  avoiding an unattended project-trust prompt. Implementers run Matt's
+  `-ne --approve`: project extensions are disabled inside generated worktrees
+  and the user-selected repository is approved for this session, avoiding
+  extension startup failures and an unattended trust prompt. Implementers run Matt's
   `/skill:implement`; optional reviewers run `/skill:code-review`. Herdr's
   `working` → `idle` transition indicates that a round settled. Implementers
   then pass only when the commit id they reported resolves to a new commit on

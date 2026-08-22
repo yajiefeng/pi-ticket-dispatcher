@@ -9,7 +9,7 @@
  * - `herdr agent start` returns the worker pane id.
  * - Herdr reports interactive Pi as `working` while handling a command and
  *   `idle` after it settles.
- * - Pane disappearance is treated as a worker crash.
+ * - Agent or pane disappearance is treated as a worker crash.
  */
 
 import { spawnSync } from "node:child_process";
@@ -324,17 +324,29 @@ export const herdrAdapter: HerdrAdapter = {
   },
 
   waitAgentIdle(target, timeoutMs) {
-    const r = spawnSync(
-      herdrBin(),
-      ["agent", "wait", target, "--status", "idle", "--timeout", String(timeoutMs)],
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }
-    );
+    const waitArgs = usesNewAgentApi()
+      ? [
+          "agent",
+          "wait",
+          target,
+          "--until",
+          "idle",
+          "--until",
+          "done",
+          "--timeout",
+          String(timeoutMs),
+        ]
+      : ["agent", "wait", target, "--status", "idle", "--timeout", String(timeoutMs)];
+    const r = spawnSync(herdrBin(), waitArgs, {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     if (r.status !== 0) return false;
-    // `agent wait` returns exit 0 even when the target is not idle yet, so we
-    // must inspect the reported agent_status ourselves.
     try {
       const parsed = JSON.parse(r.stdout);
-      return parsed?.result?.agent?.agent_status === "idle";
+      const status =
+        parsed?.result?.agent?.agent_status ?? parsed?.result?.agent?.status;
+      return status === "idle" || status === "done";
     } catch {
       return false;
     }
@@ -348,7 +360,9 @@ export const herdrAdapter: HerdrAdapter = {
     if (r.status !== 0) return undefined;
     try {
       const parsed = JSON.parse(r.stdout);
-      return parsed?.result?.agent?.agent_status;
+      return (
+        parsed?.result?.agent?.agent_status ?? parsed?.result?.agent?.status
+      );
     } catch {
       return undefined;
     }
