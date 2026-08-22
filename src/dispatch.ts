@@ -225,8 +225,7 @@ function instructWorker(
     verdictFile: role === "reviewer" ? verdictPath : undefined,
   });
 
-  deps.herdr.sendText(worker.agentName, instruction);
-  deps.herdr.sendKey(worker.paneId, "Enter");
+  deps.herdr.submitPrompt(worker.agentName, worker.paneId, instruction);
   // Record when the instruction was sent so reap can re-send it if it was
   // lost (e.g. the worker was not ready when it arrived).
   const current = state.tickets[id];
@@ -937,7 +936,10 @@ async function launchWorkerFor(
   try {
     started = deps.herdr.startAgent({
       name: agentName,
-      argv: ["pi"],
+      // Ticket worktrees are created from a repository the user explicitly
+      // selected for this run. Approve project-local Pi resources for this
+      // worker session so unattended dispatch is not blocked by the trust UI.
+      argv: ["pi", "--approve"],
       cwd: worktree,
       workspaceId: ticket.workspaceId,
       tabId,

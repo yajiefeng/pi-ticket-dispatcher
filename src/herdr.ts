@@ -39,10 +39,8 @@ export interface HerdrAdapter {
   paneExists(paneId: string): boolean;
   /** Close a pane. Errors are swallowed (the pane may already be gone). */
   closePane(paneId: string): void;
-  /** Send literal text to an agent (no Enter). */
-  sendText(target: string, text: string): void;
-  /** Send a key (e.g. "Enter") to a pane. */
-  sendKey(paneId: string, key: string): void;
+  /** Submit one complete prompt to an agent. */
+  submitPrompt(target: string, paneId: string, text: string): void;
   /** Read recent pane content (plain text, may include TUI rendering). */
   readPane(paneId: string, lines?: number): string;
   /** True if the agent reports idle (started up, waiting for input). */
@@ -129,6 +127,13 @@ function herdrMaybe(args: string[]): { ok: boolean; output: string } {
   return { ok: result.status === 0, output: result.stdout };
 }
 
+const AGENT_PANE_READY_TIMEOUT_MS = 30_000;
+const AGENT_PANE_READY_RETRY_MS = 500;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /**
  * Herdr 0.8+ worker launch: the `agent start` CLI changed to
  * "declare an existing pane as an agent" (--kind KIND --pane ID). For an
@@ -138,12 +143,13 @@ function herdrMaybe(args: string[]): { ok: boolean; output: string } {
  */
 function startAgentV8(opts: {
   name: string;
+  argv: string[];
   cwd?: string;
   workspaceId?: string;
   tabId?: string;
   paneId?: string;
 }): StartAgentResult {
-  const { name, cwd, workspaceId, tabId, paneId } = opts;
+  const { name, argv, cwd, workspaceId, tabId, paneId } = opts;
 
   // The 0.8 `agent start` targets an existing pane. With the per-ticket tab
   // layout the tab's root pane is provided by the dispatcher; otherwise fall
@@ -182,7 +188,7 @@ function startAgentV8(opts: {
     throw new Error("startAgent (v8): could not resolve a target pane");
   }
 
-  const result = herdrJson<{
+  type AgentStartEnvelope = {
     agent: {
       pane_id: string;
       workspace_id: string;
@@ -190,7 +196,35 @@ function startAgentV8(opts: {
       terminal_id: string;
       name: string;
     };
-  }>(["agent", "start", name, "--kind", "pi", "--pane", targetPaneId]);
+  };
+
+  // A newly-created tab can be visible before its shell is ready. Herdr
+  // returns agent_pane_busy immediately in that window instead of waiting.
+  // Retry only that transient error; every other launch error remains fatal.
+  const deadline = Date.now() + AGENT_PANE_READY_TIMEOUT_MS;
+  let result: AgentStartEnvelope;
+  while (true) {
+    try {
+      const piArgs = argv[0] === "pi" ? argv.slice(1) : argv;
+      result = herdrJson<AgentStartEnvelope>([
+        "agent",
+        "start",
+        name,
+        "--kind",
+        "pi",
+        "--pane",
+        targetPaneId,
+        ...(piArgs.length > 0 ? ["--", ...piArgs] : []),
+      ]);
+      break;
+    } catch (error) {
+      const transient =
+        error instanceof Error && error.message.includes("agent_pane_busy");
+      const remaining = deadline - Date.now();
+      if (!transient || remaining <= 0) throw error;
+      sleepSync(Math.min(AGENT_PANE_READY_RETRY_MS, remaining));
+    }
+  }
 
   return {
     paneId: result.agent.pane_id,
@@ -205,7 +239,7 @@ function startAgentV8(opts: {
 export const herdrAdapter: HerdrAdapter = {
   startAgent({ name, argv, cwd, workspaceId, tabId, paneId, focus }) {
     if (usesNewAgentApi()) {
-      return startAgentV8({ name, cwd, workspaceId, tabId, paneId });
+      return startAgentV8({ name, argv, cwd, workspaceId, tabId, paneId });
     }
 
     const args = ["agent", "start", name];
@@ -247,7 +281,21 @@ export const herdrAdapter: HerdrAdapter = {
     herdrMaybe(["pane", "close", paneId]);
   },
 
-  sendText(target, text) {
+  submitPrompt(target, paneId, text) {
+    if (usesNewAgentApi()) {
+      const r = spawnSync(herdrBin(), ["agent", "prompt", target, text], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (r.status !== 0) {
+        throw new Error(
+          `${herdrBin()} agent prompt exited ${r.status}: ${(r.stderr || r.stdout || "").trim()}`
+        );
+      }
+      return;
+    }
+
+    // Herdr 0.7 has only literal `agent send`, so submit Enter separately.
     const r = spawnSync(herdrBin(), ["agent", "send", target, text], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -257,10 +305,7 @@ export const herdrAdapter: HerdrAdapter = {
         `${herdrBin()} agent send exited ${r.status}: ${(r.stderr || r.stdout || "").trim()}`
       );
     }
-  },
-
-  sendKey(paneId, key) {
-    herdrMaybe(["pane", "send-keys", paneId, key]);
+    herdrMaybe(["pane", "send-keys", paneId, "Enter"]);
   },
 
   readPane(paneId, lines = 80) {

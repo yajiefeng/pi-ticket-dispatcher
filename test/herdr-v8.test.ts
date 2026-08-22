@@ -38,8 +38,8 @@ case "$1" in
   agent)
     case "$2" in
       start) echo "CALL:$*" >> "$FAKE_LOG"; echo '{"id":"cli:agent:start","result":{"agent":{"pane_id":"w9:p1","workspace_id":"w9","tab_id":"w9:t1","terminal_id":"term_x","name":"ticket-x-impl-1"},"argv":["pi"],"type":"agent_started"}}'; exit 0;;
-      wait)  echo '{"id":"cli:agent:wait","result":{"type":"ok"}}'; exit 0;;
-      send)  echo '{"id":"cli:agent:send","result":{"type":"ok"}}'; exit 0;;
+      wait)   echo '{"id":"cli:agent:wait","result":{"type":"ok"}}'; exit 0;;
+      prompt) echo "CALL:$*" >> "$FAKE_LOG"; echo '{"id":"cli:agent:prompt","result":{"type":"ok"}}'; exit 0;;
     esac;;
   pane)
     case "$2" in
@@ -72,7 +72,7 @@ test("v8 adapter: existing workspace -> pane list + agent start --kind pi --pane
   installFakeHerdr();
   const result = herdrAdapter.startAgent({
     name: "ticket-x-impl-1",
-    argv: ["pi"],
+    argv: ["pi", "--approve"],
     cwd: "/tmp/wt",
     workspaceId: "w9",
     focus: false,
@@ -81,7 +81,16 @@ test("v8 adapter: existing workspace -> pane list + agent start --kind pi --pane
   assert.equal(result.workspaceId, "w9");
   const callsList = calls();
   assert.ok(callsList[0].includes("pane list --workspace w9"), callsList[0]);
-  assert.ok(callsList[1].includes("agent start ticket-x-impl-1 --kind pi --pane w9:p1"), callsList[1]);
+  assert.ok(
+    callsList[1].includes("agent start ticket-x-impl-1 --kind pi --pane w9:p1 -- --approve"),
+    callsList[1]
+  );
+});
+
+test("v8 adapter: submits prompts atomically with agent prompt", () => {
+  installFakeHerdr();
+  herdrAdapter.submitPrompt("ticket-x-impl-1", "w9:p1", "do the ticket");
+  assert.deepEqual(calls(), ["CALL:agent prompt ticket-x-impl-1 do the ticket"]);
 });
 
 test("v8 adapter: no workspace -> pane split --cwd fallback then agent start", () => {
@@ -119,6 +128,31 @@ test("v8 adapter: pane list with no panes throws (-> waiting_human upstream)", (
       }),
     /no pane in workspace w9/
   );
+});
+
+test("v8 adapter: retries agent_pane_busy while a new pane shell becomes ready", () => {
+  installFakeHerdr();
+  const orig = fs.readFileSync(fakeBin, "utf-8");
+  const busyOnceFile = path.join(temp, "busy-once");
+  fs.rmSync(busyOnceFile, { force: true });
+  fs.writeFileSync(
+    fakeBin,
+    orig.replace(
+      'start) echo "CALL:$*" >> "$FAKE_LOG"; echo \'{"id":"cli:agent:start","result":{"agent":{"pane_id":"w9:p1","workspace_id":"w9","tab_id":"w9:t1","terminal_id":"term_x","name":"ticket-x-impl-1"},"argv":["pi"],"type":"agent_started"}}\'; exit 0;;',
+      `start) echo "CALL:$*" >> "$FAKE_LOG"; if [ ! -f "${busyOnceFile}" ]; then touch "${busyOnceFile}"; echo 'agent_pane_busy' >&2; exit 1; fi; echo '{"id":"cli:agent:start","result":{"agent":{"pane_id":"w9:p1","workspace_id":"w9","tab_id":"w9:t1","terminal_id":"term_x","name":"ticket-x-impl-1"},"argv":["pi"],"type":"agent_started"}}'; exit 0;;`
+    ),
+    { mode: 0o755 }
+  );
+
+  const result = herdrAdapter.startAgent({
+    name: "ticket-x-impl-1",
+    argv: ["pi"],
+    cwd: "/tmp/wt",
+    workspaceId: "w9",
+  });
+
+  assert.equal(result.paneId, "w9:p1");
+  assert.equal(calls().filter((call) => call.includes("agent start")).length, 2);
 });
 
 test("v8 adapter: agent start failure throws", () => {

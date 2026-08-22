@@ -64,10 +64,8 @@ class FakeHerdr implements HerdrAdapter {
   closePane(paneId: string): void {
     this.panes.delete(paneId);
   }
-  sendText(target: string, text: string): void {
+  submitPrompt(target: string, paneId: string, text: string): void {
     this.sent.push({ target, text });
-  }
-  sendKey(paneId: string, _key: string): void {
     const pane = this.panes.get(paneId);
     if (pane) this.statuses.set(pane.name, "working");
   }
@@ -207,6 +205,7 @@ test("full run: start -> implement -> integrate -> unlock -> complete", async ()
   assert.deepEqual(eventTypes(r), ["worker_started"]);
   assert.equal((r.events[0] as { ticketId?: string }).ticketId, "TKT-001");
   const launchedPane = herdr.panes.keys().next().value as string;
+  assert.deepEqual(herdr.panes.get(launchedPane)!.argv, ["pi", "--approve"]);
   assert.ok(herdr.lastInstruction(launchedPane).text.startsWith("/skill:implement"));
 
   // Worker completes with a clean commit.
