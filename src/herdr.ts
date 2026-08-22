@@ -5,15 +5,11 @@
  * `herdr` CLI (client -> server socket). Keeping this behind a narrow
  * interface lets the dispatch state machine be unit-tested with a fake.
  *
- * Worker lifecycle facts this adapter relies on (verified empirically):
- * - `herdr agent start <name> --cwd <dir> --no-focus -- <argv>` returns a
- *   JSON envelope with the new pane id.
- * - When the started process exits, Herdr releases the agent and closes the
- *   pane. That is why workers write their output and exit code to files
- *   (via `sh -c` redirection) before the pane disappears.
- * - `herdr agent wait --status done` is a UI-only state; CLI completion
- *   waits use `idle`. We never rely on agent status: completion is detected
- *   by the exit-code file, crashes by a missing pane.
+ * Worker lifecycle facts this adapter relies on:
+ * - `herdr agent start` returns the worker pane id.
+ * - Herdr reports interactive Pi as `working` while handling a command and
+ *   `idle` after it settles.
+ * - Pane disappearance is treated as a worker crash.
  */
 
 import { spawnSync } from "node:child_process";

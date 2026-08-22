@@ -15,8 +15,9 @@
  * - resolve: answer a waiting_human decision
  * - cleanup: remove worktrees/panes/artifacts for integrated/failed tickets
  *
- * Workers are Herdr-managed one-shot `pi -p` processes. Their completion is
- * detected by per-round exit-code files; crashes by a missing pane.
+ * Workers are Herdr-managed interactive Pi agents. Completion is detected
+ * from Herdr's working -> idle transition, then verified by role-specific
+ * artifacts: a reported git commit for implementers or a verdict file for reviewers.
  */
 
 import * as fs from "node:fs";
@@ -51,7 +52,7 @@ import {
   parseVerdict,
   promptFile,
   readIfExists,
-  roundMarker,
+  reportedCommitIds,
   sanitizeId,
   ticketWorkDir,
   verdictFile,
@@ -90,9 +91,9 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_WAIT_MS = 60_000;
 const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 1_000;
-/** Re-send a worker's instruction if it has been idle this long without the marker. */
+/** Re-send a worker's instruction if it remains idle without a result this long. */
 const REINSTRUCT_INTERVAL_MS = 90_000;
-/** If a worker reports non-working for this long without the marker, it is stalled: auto-restart it. */
+/** If a worker reports non-working for this long without a result, it is stalled: auto-restart it. */
 const IDLE_TIMEOUT_MS = 30 * 60_000;
 /** Auto-restarts per worker before pausing for a human. */
 const MAX_WORKER_RESTARTS = 2;
@@ -187,10 +188,9 @@ interface ReapContext {
 // ---------------------------------------------------------------------------
 
 /**
- * Send a task instruction to a worker's interactive pi. Writes the per-round
- * prompt file and submits a single-line instruction carrying a unique
- * completion marker (DONE-<ID>-<round>). The worker pane is reused across
- * rounds so it keeps context; only a crashed/missing pane is relaunched.
+ * Send a Matt skill command to a worker's interactive Pi. The worker pane is
+ * reused across rounds so it keeps context; only a crashed/missing pane is
+ * relaunched.
  */
 function instructWorker(
   state: DispatchState,
@@ -218,14 +218,11 @@ function instructWorker(
         });
   fs.writeFileSync(promptPath, prompt, "utf-8");
 
-  const marker = roundMarker(id, round);
   const instruction = buildTaskInstruction({
+    role,
     promptFile: promptPath,
-    marker,
-    extra:
-      role === "reviewer"
-        ? "Do not modify any files and do not commit anything."
-        : undefined,
+    baseBranch: state.baseBranch,
+    verdictFile: role === "reviewer" ? verdictPath : undefined,
   });
 
   deps.herdr.sendText(worker.agentName, instruction);
@@ -238,7 +235,7 @@ function instructWorker(
   } else {
     current.implementer = current.implementer ? { ...current.implementer, instructionSentAt: deps.now() } : current.implementer;
   }
-  deps.log?.(`instructed ${role} ${worker.agentName} (round ${round}, marker ${marker})`);
+  deps.log?.(`instructed ${role} ${worker.agentName} with Matt skill (round ${round})`);
 }
 
 /** Wait for an interactive pi worker to finish starting up (herdr idle). */
@@ -256,7 +253,7 @@ async function waitForWorkerIdle(
 }
 
 // ---------------------------------------------------------------------------
-// Phase: reap completed workers (interactive: marker detection + git verify)
+// Phase: reap completed workers (Herdr status + role-specific verification)
 // ---------------------------------------------------------------------------
 
 function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps): void {
@@ -266,68 +263,69 @@ function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps)
     const worker = activeWorker(ticket);
     if (!worker?.paneId) continue;
     const round = worker.round ?? ticket.round;
-    const marker = roundMarker(id, round);
 
-    // Crashed: pane gone without producing a marker -> relaunch (or fail).
     if (!deps.herdr.paneExists(worker.paneId)) {
-      if (ticket.status === "reviewing") {
-        restartReviewer(state, ticket, worker, ctx);
-      } else {
-        crashImplementer(state, ticket, worker, ctx);
+      if (ticket.status === "reviewing") restartReviewer(state, ticket, worker, ctx);
+      else crashImplementer(state, ticket, worker, ctx);
+      continue;
+    }
+
+    const status = deps.herdr.agentStatus(worker.agentName);
+    const paneText = deps.herdr.readPane(worker.paneId, 120);
+
+    if (status === "working") {
+      if (worker.status !== "working") {
+        worker.status = "working";
+        worker.lastActiveAt = deps.now();
+        ctx.changed = true;
       }
       continue;
     }
 
-    const paneText = deps.herdr.readPane(worker.paneId, 120);
-    // Line-exact marker match: the instruction itself contains the marker text
-    // (it is echoed in the TUI), so a substring match would always succeed.
-    const markerSeen = paneText
-      .split("\n")
-      .some((line) => line.trim() === marker);
-    if (!markerSeen) {
-      const status = deps.herdr.agentStatus(worker.agentName);
-
-      // A working agent is making progress: keep waiting, no timeout.
-      if (status === "working") {
-        if (worker.lastActiveAt !== deps.now()) {
-          worker.lastActiveAt = deps.now();
-          ctx.changed = true;
-        }
-        continue;
+    const verdictExists =
+      ticket.status === "reviewing" && readIfExists(verdictFile(state, id, round)) !== undefined;
+    let reportedCommit: string | undefined;
+    if (ticket.status !== "reviewing" && ticket.status !== "resolving" && worker.baseCommit) {
+      for (const commitId of reportedCommitIds(paneText).reverse()) {
+        reportedCommit = git.verifyReportedCommit(worker.worktreePath, commitId, worker.baseCommit);
+        if (reportedCommit) break;
       }
-
-      // Idle / unknown / done with no marker: the instruction may have been
-      // lost (worker not ready when sent). Re-send it periodically.
-      const lastSent = worker.instructionSentAt ?? worker.startedAt;
-      if (deps.now() - lastSent > REINSTRUCT_INTERVAL_MS) {
-        instructWorker(
-          state,
-          ticket,
-          ticket.status === "reviewing" ? ("reviewer" as const) : ("implementer" as const),
-          worker,
-          deps
-        );
-        ctx.changed = true;
-        continue;
-      }
-
-      // Still idle and no progress for a long stretch: the worker is stalled.
-      // Auto-restart it; only ask the human after repeated stalls.
-      const lastActive = worker.lastActiveAt ?? worker.startedAt;
-      if (deps.now() - lastActive > IDLE_TIMEOUT_MS) {
-        restartStalledWorker(state, ticket, worker, ctx, deps);
-        continue;
-      }
-      continue; // still running
     }
 
-    // Marker found: the worker finished its round.
-    if (ticket.status === "reviewing") {
-      handleReviewerDone(state, ticket, worker, round, ctx, deps);
-    } else if (ticket.status === "resolving") {
-      handleConflictWorkerDone(state, ticket, worker, round, ctx, deps);
-    } else {
-      handleImplementerDone(state, ticket, worker, round, ctx, deps);
+    // A valid role-specific artifact also proves completion when a very fast
+    // worker went working -> idle between two dispatcher polls.
+    const settled = status === "idle" || status === "done";
+    const completed = settled && (worker.status === "working" || verdictExists || reportedCommit !== undefined);
+    if (completed) {
+      worker.status = "idle";
+      if (ticket.status === "reviewing") {
+        handleReviewerDone(state, ticket, worker, round, ctx, deps);
+      } else if (ticket.status === "resolving") {
+        handleConflictWorkerDone(state, ticket, worker, round, ctx, deps);
+      } else {
+        handleImplementerDone(state, ticket, worker, round, reportedCommit, ctx, deps);
+      }
+      continue;
+    }
+
+    // Idle without a result may mean Pi was not ready when the command was
+    // sent. Re-send periodically, then restart after a prolonged stall.
+    const lastSent = worker.instructionSentAt ?? worker.startedAt;
+    if (deps.now() - lastSent > REINSTRUCT_INTERVAL_MS) {
+      instructWorker(
+        state,
+        ticket,
+        ticket.status === "reviewing" ? ("reviewer" as const) : ("implementer" as const),
+        worker,
+        deps
+      );
+      ctx.changed = true;
+      continue;
+    }
+
+    const lastActive = worker.lastActiveAt ?? worker.startedAt;
+    if (deps.now() - lastActive > IDLE_TIMEOUT_MS) {
+      restartStalledWorker(state, ticket, worker, ctx, deps);
     }
   }
 }
@@ -462,18 +460,15 @@ function handleImplementerDone(
   ticket: TicketState,
   worker: WorkerInfo,
   round: number,
+  reportedCommit: string | undefined,
   ctx: ReapContext,
   deps: ResolvedDeps
 ): void {
   const id = ticket.ticket.id;
   const worktree = ticket.worktreePath ?? worker.worktreePath;
 
-  if (
-    worktree &&
-    git.hasNewCommits(worktree, state.baseBranch) &&
-    !git.isWorktreeDirty(worktree)
-  ) {
-    const commitSha = git.getHeadCommit(worktree);
+  if (worktree && reportedCommit && !git.isWorktreeDirty(worktree)) {
+    const commitSha = reportedCommit;
     const updated = addAttempt(ticket, {
       type: ticket.status === "fixing" ? ("fix" as const) : ("implement" as const),
       startedAt: worker.startedAt,
@@ -497,7 +492,7 @@ function handleImplementerDone(
     ? "your worktree is missing"
     : git.isWorktreeDirty(worktree)
       ? "you left uncommitted changes in the worktree"
-      : "you made no commits";
+      : "your completed response did not report a new commit id from this round";
   instructImplementerFix(state, ticket, worker, reason, ctx, deps);
 }
 
@@ -560,7 +555,13 @@ function handleConflictWorkerDone(
   }
 
   const nextRound = updated.round + 1;
-  const nextWorker: WorkerInfo = { ...worker, round: nextRound, startedAt: deps.now() };
+  const nextWorker: WorkerInfo = {
+    ...worker,
+    round: nextRound,
+    startedAt: deps.now(),
+    status: "starting",
+    baseCommit: worktree ? git.getHeadCommit(worktree) : worker.baseCommit,
+  };
   updated.implementer = nextWorker;
   updated.round = nextRound;
   state.tickets[id] = updated;
@@ -609,7 +610,13 @@ function instructImplementerFix(
   }
 
   const nextRound = updated.round + 1;
-  const nextWorker: WorkerInfo = { ...worker, round: nextRound, startedAt: deps.now() };
+  const nextWorker: WorkerInfo = {
+    ...worker,
+    round: nextRound,
+    startedAt: deps.now(),
+    status: "starting",
+    baseCommit: worker.worktreePath ? git.getHeadCommit(worker.worktreePath) : worker.baseCommit,
+  };
   if (updated.status === "reviewing") {
     // came from a rejected review -> fixing round
     updated.status = "fixing";
@@ -618,7 +625,7 @@ function instructImplementerFix(
   updated.round = nextRound;
   state.tickets[id] = updated;
   instructWorker(state, updated, "implementer", nextWorker, deps, {
-    reason: `Your previous attempt did not pass verification: ${reason}. Fix it, commit, and reply with the marker.`,
+    reason: `Your previous attempt did not pass verification: ${reason}. Fix it, commit it, and report the new commit id.`,
   });
   ctx.events.push({
     type: "worker_retrying",
@@ -673,7 +680,12 @@ function handleReviewerDone(
       return;
     }
     const nextRound = updated.round + 1;
-    const nextWorker: WorkerInfo = { ...worker, round: nextRound, startedAt: deps.now() };
+    const nextWorker: WorkerInfo = {
+      ...worker,
+      round: nextRound,
+      startedAt: deps.now(),
+      status: "starting",
+    };
     updated.reviewer = nextWorker;
     updated.round = nextRound;
     state.tickets[id] = updated;
@@ -714,7 +726,15 @@ function handleReviewerDone(
   if (implementer?.paneId) {
     // Reuse the implementer pane with feedback (keeps context).
     const nextRound = updated.round + 1;
-    const nextWorker: WorkerInfo = { ...implementer, round: nextRound, startedAt: deps.now() };
+    const nextWorker: WorkerInfo = {
+      ...implementer,
+      round: nextRound,
+      startedAt: deps.now(),
+      status: "starting",
+      baseCommit: implementer.worktreePath
+        ? git.getHeadCommit(implementer.worktreePath)
+        : implementer.baseCommit,
+    };
     updated.implementer = nextWorker;
     updated.round = nextRound;
     state.tickets[id] = updated;
@@ -947,6 +967,7 @@ async function launchWorkerFor(
     startedAt: deps.now(),
     status: "starting",
     round,
+    baseCommit: isReviewer ? undefined : git.getHeadCommit(worktree),
     workspaceId: started.workspaceId,
     tabId,
   };
@@ -975,7 +996,13 @@ async function launchWorkerFor(
         "(reap will re-send it if it was lost)"
     );
   }
-  instructWorker(state, state.tickets[id], isReviewer ? "reviewer" : "implementer", workerInfo, deps);
+  instructWorker(
+    state,
+    state.tickets[id],
+    isReviewer ? "reviewer" : "implementer",
+    activeWorker(state.tickets[id]) ?? workerInfo,
+    deps
+  );
   state.tickets[id].updatedAt = deps.now();
   saveState(state);
 
@@ -1281,7 +1308,7 @@ export function dispatchResume(
 
   // Migrate state written by older worker models (pre-56c3528: one-shot
   // `pi -p` workers detected via exit-code files). The new model uses
-  // interactive pi workers with per-round markers, so stale worker records
+  // interactive Pi workers with Herdr status-based completion, so stale worker records
   // must be cleared (advance relaunches them) and the round counter seeded.
   const migrated = migrateLegacyState(state);
   if (migrated) saveState(state);

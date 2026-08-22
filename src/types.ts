@@ -50,6 +50,8 @@ export interface WorkerInfo {
   tabId?: string;
   /** When the current task instruction was last sent (for re-sending lost instructions). */
   instructionSentAt?: number;
+  /** HEAD before this implementation round; reported commits must be newer than it. */
+  baseCommit?: string;
   /** Last time the agent reported a non-idle (working) status. */
   lastActiveAt?: number;
 }

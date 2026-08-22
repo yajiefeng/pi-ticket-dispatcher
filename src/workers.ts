@@ -1,13 +1,9 @@
 /**
  * Worker prompts and artifacts for the ticket dispatcher.
  *
- * A "worker" is a one-shot `pi -p` process launched by Herdr inside the
- * ticket's git worktree. Because Herdr closes the pane when the process
- * exits, every worker writes its prompt, log, and exit code to files in the
- * dispatcher state dir (outside the worktree, so the repo stays clean).
- *
- * Artifacts are per-round (round-N.*) so a crashed worker can never
- * overwrite a live one's files.
+ * A worker is an interactive Pi agent launched by Herdr inside the ticket's
+ * git worktree. Per-round prompts and reviewer verdicts live in the dispatcher
+ * state directory, outside the worktree so the repository stays clean.
  */
 
 import * as fs from "node:fs";
@@ -34,14 +30,6 @@ export function promptFile(state: DispatchState, ticketId: string, round: number
   return roundFile(state, ticketId, round, "prompt.md");
 }
 
-export function logFile(state: DispatchState, ticketId: string, round: number): string {
-  return roundFile(state, ticketId, round, "log");
-}
-
-export function exitFile(state: DispatchState, ticketId: string, round: number): string {
-  return roundFile(state, ticketId, round, "exit");
-}
-
 export function verdictFile(state: DispatchState, ticketId: string, round: number): string {
   return roundFile(state, ticketId, round, "verdict.txt");
 }
@@ -53,23 +41,6 @@ export function readIfExists(file: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-/** Tail of a file (last `lines` lines). */
-export function tailFile(file: string, lines = 15): string {
-  const content = readIfExists(file);
-  if (content === undefined) return "";
-  const all = content.replace(/\r\n/g, "\n").split("\n").filter((l) => l.length > 0);
-  return all.slice(-lines).join("\n");
-}
-
-/** The shell script that runs a one-shot worker and persists its result. */
-export function buildWorkerScript(prompt: string, log: string, exit: string): string {
-  const q = (s: string) => `"${s.replace(/"/g, '\\"')}"`;
-  return [
-    `pi -p "$(cat ${q(prompt)})" > ${q(log)} 2>&1`,
-    `echo $? > ${q(exit)}`,
-  ].join("; ");
 }
 
 /** Build the implementer (or fix) prompt for a ticket. */
@@ -96,7 +67,7 @@ export function buildImplementerPrompt(params: {
     "",
     "## Done criteria",
     "- Your changes are committed and the working tree is clean (no uncommitted changes).",
-    "- Reply with a short summary of what you changed and the commit SHA(s).",
+    "- Reply with a short summary and a final `COMMIT: <sha>` line for the commit you created.",
   ];
 
   if (feedback) {
@@ -193,30 +164,28 @@ export function activeWorker(ticket: TicketState): WorkerInfo | undefined {
   return ticket.implementer;
 }
 
-/**
- * Unique completion marker for one worker round. The worker must reply with
- * exactly this token when finished, so completion detection is unambiguous
- * even after retries/resumes (old markers from earlier rounds are ignored).
- */
-export function roundMarker(ticketId: string, round: number): string {
-  return `DONE-${sanitizeId(ticketId).toUpperCase()}-${round}`;
+/** Build the Pi skill command for one worker round. */
+export function buildTaskInstruction(params: {
+  role: "implementer" | "reviewer";
+  promptFile: string;
+  baseBranch: string;
+  verdictFile?: string;
+}): string {
+  const { role, promptFile, baseBranch, verdictFile } = params;
+  if (role === "implementer") {
+    return `/skill:implement Implement only the ticket specified in ${promptFile}. Follow that file as the ticket spec.`;
+  }
+  return (
+    `/skill:code-review ${baseBranch}. Review only the ticket specified in ${promptFile}. ` +
+    `Use that file as the spec and write the required structured verdict to ${verdictFile}.`
+  );
 }
 
-/**
- * The single-line instruction sent to an interactive worker. The full task
- * brief lives in a file (written by the dispatcher); the worker reads it,
- * executes, and replies with the marker when done.
- */
-export function buildTaskInstruction(params: {
-  promptFile: string;
-  marker: string;
-  extra?: string;
-}): string {
-  const { promptFile, marker, extra } = params;
-  const lines = [
-    `Read the file ${promptFile} and follow its instructions completely.`,
-    ...(extra ? [extra] : []),
-    `When you are done, reply on a single line with exactly: ${marker}`,
-  ];
-  return lines.join(" ");
+/** Commit ids explicitly reported on commit/SHA lines in Pi's response. */
+export function reportedCommitIds(paneText: string): string[] {
+  const ids = paneText
+    .split("\n")
+    .filter((line) => /\b(commit(?:ted)?|sha)\b/i.test(line))
+    .flatMap((line) => line.match(/\b[0-9a-f]{7,40}\b/gi) ?? []);
+  return [...new Set(ids.map((id) => id.toLowerCase()))];
 }

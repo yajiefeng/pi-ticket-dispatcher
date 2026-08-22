@@ -67,7 +67,10 @@ class FakeHerdr implements HerdrAdapter {
   sendText(target: string, text: string): void {
     this.sent.push({ target, text });
   }
-  sendKey(_paneId: string, _key: string): void {}
+  sendKey(paneId: string, _key: string): void {
+    const pane = this.panes.get(paneId);
+    if (pane) this.statuses.set(pane.name, "working");
+  }
   readPane(paneId: string): string {
     return this.panes.get(paneId)?.content ?? "";
   }
@@ -110,40 +113,37 @@ class FakeHerdr implements HerdrAdapter {
     assert.ok(last, `no instruction sent to ${name}`);
     return last!;
   }
-  /** The unique completion marker in the last instruction sent to this pane. */
-  markerOf(paneId: string): string {
-    const m = this.lastInstruction(paneId).text.match(/(DONE-[A-Z0-9_-]+-\d+)/);
-    assert.ok(m, `no marker in instruction: ${this.lastInstruction(paneId).text}`);
-    return m![1];
-  }
   promptContentOf(paneId: string): string {
-    const m = this.lastInstruction(paneId).text.match(/Read the file (\S+)/);
+    const m = this.lastInstruction(paneId).text.match(/specified in (\S+)/);
     assert.ok(m, `no prompt path in instruction`);
     return fs.readFileSync(m![1], "utf-8");
   }
   verdictPathOf(paneId: string): string {
-    const prompt = this.promptContentOf(paneId);
-    const m = prompt.match(/at exactly this path:\s*([^\n]+)/);
-    assert.ok(m, `no verdict path in prompt: ${prompt}`);
-    return m![1].trim();
+    const instruction = this.lastInstruction(paneId).text;
+    const m = instruction.match(/structured verdict to (\S+)\.?$/);
+    assert.ok(m, `no verdict path in instruction: ${instruction}`);
+    return m![1].replace(/\.$/, "");
   }
-  /** Simulate the worker committing a change in its worktree. */
+  /** Simulate the worker committing and reporting the exact commit id. */
   workerCommits(paneId: string, file = "impl.txt", content = "done"): void {
-    const cwd = this.panes.get(paneId)!.cwd;
+    const pane = this.panes.get(paneId)!;
+    const cwd = pane.cwd;
     fs.writeFileSync(path.join(cwd, file), content);
     try {
       sh("git add -A && git commit -m 'implement ticket'", cwd);
+      const commit = sh("git rev-parse HEAD", cwd);
+      pane.content = `${pane.content}\nImplemented and committed as ${commit}`;
     } catch (e) {
       console.error("WORKER COMMIT FAILED in", cwd, "\nSTDERR:", (e as any).stderr, "\nSTDOUT:", (e as any).stdout);
       throw e;
     }
   }
-  /** Simulate the worker replying with its completion marker (round done). */
+  /** Simulate the worker returning to Herdr idle after its skill completes. */
   workerDone(paneId: string): void {
     const pane = this.panes.get(paneId)!;
-    pane.content = (pane.content ? pane.content + "\n" : "") + this.markerOf(paneId);
+    this.statuses.set(pane.name, "idle");
   }
-  /** Simulate a crash: pane disappears without a completion marker. */
+  /** Simulate a crash: pane disappears before completion. */
   workerCrashes(paneId: string): void {
     this.panes.delete(paneId);
   }
@@ -206,6 +206,8 @@ test("full run: start -> implement -> integrate -> unlock -> complete", async ()
   let r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.deepEqual(eventTypes(r), ["worker_started"]);
   assert.equal((r.events[0] as { ticketId?: string }).ticketId, "TKT-001");
+  const launchedPane = herdr.panes.keys().next().value as string;
+  assert.ok(herdr.lastInstruction(launchedPane).text.startsWith("/skill:implement"));
 
   // Worker completes with a clean commit.
   const p1 = herdr.panes.keys().next().value as string;
@@ -290,6 +292,26 @@ test("failed attempt relaunches, then exceeds maxAttempts and fails", async () =
   assert.equal(r.summary["failed"], 1);
 });
 
+test("an old or unrelated reported commit does not pass implementation verification", async () => {
+  const repo = makeGitRepo();
+  const herdr = new FakeHerdr();
+  await run({
+    action: "start",
+    targetRepo: repo,
+    ticketsSource: JSON.stringify([{ id: "X", title: "X", description: "", dependsOn: [] }]),
+    maxAttempts: 1,
+  }, herdr);
+  await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  const paneId = herdr.panes.keys().next().value as string;
+  const oldCommit = sh("git rev-parse HEAD", repo);
+  herdr.panes.get(paneId)!.content = `Commit: ${oldCommit}`;
+  herdr.workerDone(paneId);
+
+  const result = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
+  assert.ok(eventTypes(result).includes("ticket_failed"));
+  assert.equal(result.summary.failed, 1);
+});
+
 test("dirty worktree counts as a failed attempt", async () => {
   const repo = makeGitRepo();
   const herdr = new FakeHerdr();
@@ -304,7 +326,7 @@ test("dirty worktree counts as a failed attempt", async () => {
   assert.deepEqual(eventTypes(r), ["ticket_failed", "run_completed"]);
 });
 
-test("crashed worker (pane gone, no exit file) is relaunched", async () => {
+test("crashed worker (pane gone before completion) is relaunched", async () => {
   const repo = makeGitRepo();
   const herdr = new FakeHerdr();
   await run({ action: "start", targetRepo: repo, ticketsSource: JSON.stringify([{ id: "X", title: "X", description: "", dependsOn: [] }]) }, herdr);
@@ -339,6 +361,7 @@ test("reviewer approves -> integrates; reviewer rejects -> fix round", async () 
 
   // Reviewer rejects with feedback -> fix round reuses the implementer pane.
   const reviewPane1 = [...herdr.panes.keys()].pop() as string;
+  assert.ok(herdr.lastInstruction(reviewPane1).text.startsWith("/skill:code-review"));
   const verdictPath = herdr.verdictPathOf(reviewPane1);
   fs.writeFileSync(verdictPath, "APPROVED: no\nFEEDBACK: add more tests\n");
   herdr.workerDone(reviewPane1);
@@ -441,6 +464,8 @@ test("merge conflict is auto-resolved by a conflict worker, then integrated", as
   const cwd = herdr.panes.get(p)!.cwd;
   fs.writeFileSync(path.join(cwd, "conflict.txt"), "from worker\n");
   sh("git add -A && git commit -m 'worker version'", cwd);
+  const workerCommit = sh("git rev-parse HEAD", cwd);
+  herdr.panes.get(p)!.content += `\nImplemented and committed as ${workerCommit}`;
   herdr.workerDone(p);
 
   // Advance: ready -> merge conflicts -> rebase conflicts -> a conflict
@@ -480,6 +505,9 @@ test("stalled idle worker is auto-restarted, then pauses for a human", async () 
   const age = (ms: number) => {
     const st = JSON.parse(fs.readFileSync(statePath, "utf-8"));
     st.tickets.X.implementer.lastActiveAt = Date.now() - ms;
+    st.tickets.X.implementer.status = "starting";
+    const pane = herdr.panes.get(st.tickets.X.implementer.paneId);
+    if (pane) herdr.statuses.set(pane.name, "idle");
     fs.writeFileSync(statePath, JSON.stringify(st), "utf-8");
   };
 
@@ -544,9 +572,11 @@ test("re-sends a lost worker instruction", async () => {
   await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.equal(herdr.sent.length, 1);
 
-  // Simulate a lost instruction: the worker is idle, no marker ever appears,
+  // Simulate a lost instruction: the worker is idle, no result ever appears,
   // and the last send was long ago.
   herdr.sent = [];
+  const workerName = herdr.panes.values().next().value!.name;
+  herdr.statuses.set(workerName, "idle");
   const statePath = path.join(repo, ".pi-ticket-dispatcher", "state.json");
   const st = JSON.parse(fs.readFileSync(statePath, "utf-8"));
   st.tickets.X.implementer.instructionSentAt = Date.now() - 200_000;
@@ -554,5 +584,5 @@ test("re-sends a lost worker instruction", async () => {
 
   const r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
   assert.equal(herdr.sent.length, 1, "lost instruction should be re-sent");
-  assert.ok(herdr.sent[0].text.includes("DONE-X-1"), herdr.sent[0].text);
+  assert.ok(herdr.sent[0].text.startsWith("/skill:implement"), herdr.sent[0].text);
 });

@@ -187,6 +187,40 @@ export function getHeadCommit(worktreePath: string): string {
   return result.stdout;
 }
 
+/** Resolve a commit id (including an abbreviated SHA) to its full SHA. */
+export function resolveCommit(worktreePath: string, commitId: string): string | undefined {
+  const result = gitRun(worktreePath, ["rev-parse", "--verify", `${commitId}^{commit}`]);
+  return result.exitCode === 0 ? result.stdout : undefined;
+}
+
+/**
+ * Verify that a worker-reported commit belongs to this round and the current
+ * branch: the round's starting HEAD must be its ancestor, and it must be
+ * reachable from the current HEAD.
+ */
+export function verifyReportedCommit(
+  worktreePath: string,
+  commitId: string,
+  roundBaseCommit: string
+): string | undefined {
+  const commit = resolveCommit(worktreePath, commitId);
+  if (!commit || commit === roundBaseCommit) return undefined;
+  const afterRoundBase = gitRun(worktreePath, [
+    "merge-base",
+    "--is-ancestor",
+    roundBaseCommit,
+    commit,
+  ]);
+  if (afterRoundBase.exitCode !== 0) return undefined;
+  const onCurrentBranch = gitRun(worktreePath, [
+    "merge-base",
+    "--is-ancestor",
+    commit,
+    "HEAD",
+  ]);
+  return onCurrentBranch.exitCode === 0 ? commit : undefined;
+}
+
 /**
  * Check if the worktree has any new commits compared to the base branch.
  * Returns true if there are new commits.

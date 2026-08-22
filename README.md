@@ -24,10 +24,11 @@ Herdr
   time. All side effects happen inside `ticket_dispatch` calls.
 - **Workers are interactive `pi` processes** launched by Herdr into per-ticket
   git worktrees, each in its own tab (`ticket <id>`) inside the Dispatcher's
-  workspace — the workspace list stays clean. You can watch them work and
-  see their Herdr `working`/`idle` status; each round is submitted as a
-  single-line instruction carrying a unique completion marker
-  (`DONE-<ID>-<round>`) that the worker replies with when done.
+  workspace — the workspace list stays clean. Implementers run Matt's
+  `/skill:implement`; optional reviewers run `/skill:code-review`. Herdr's
+  `working` → `idle` transition indicates that a round settled. Implementers
+  then pass only when the commit id they reported resolves to a new commit on
+  the ticket branch and the worktree is clean; reviewers write a verdict file.
 - **State lives in `<targetRepo>/.pi-ticket-dispatcher/state.json`** and is
   written atomically around every side effect, so interrupted runs resume
   cleanly (a vanished worker pane is detected and relaunched, counting as an
@@ -39,8 +40,9 @@ Herdr
 pi install /path/to/pi-ticket-dispatcher     # or git/npm source
 ```
 
-Requires the `herdr` CLI on `PATH` (see [herdr.dev](https://herdr.dev)) and a
-configured Pi provider for the workers.
+Requires the `herdr` CLI on `PATH` (see [herdr.dev](https://herdr.dev)), a
+configured Pi provider, and Matt's `implement` and `code-review` skills enabled
+for the worker Pi processes.
 
 ## Usage
 
@@ -66,7 +68,7 @@ configured Pi provider for the workers.
 | `advance` | One bounded, idempotent progression: reap finished workers → integrate ready branches → launch new workers (up to `maxParallel`); optionally waits up to `waitMs` for the next observable event. |
 | `status` | Report state, no side effects. |
 | `resolve` | Answer a `waiting_human` decision: `retry_launch`, `fail_ticket`, or `cancel_run`. |
-| `cleanup` | Close panes, remove worktrees/branches for integrated (and optionally failed) tickets; remove worker logs and (optionally) all state. |
+| `cleanup` | Close panes, remove worktrees/branches for integrated (and optionally failed) tickets; remove worker artifacts and (optionally) all state. |
 
 ### Options
 
@@ -83,9 +85,9 @@ configured Pi provider for the workers.
   model cannot corrupt it (see `src/types.ts`, `src/state.ts`).
 - **Idempotent progress** — `advance` always reloads state; repeated calls are
   safe. Worktree/worker creation is deduplicated by canonical path / pane id.
-- **Crash recovery** — worker artifacts are per-round files (`round-N.*`) so a
-  crashed worker can never corrupt a live one; a pane that vanished without an
-  exit file is detected and relaunched, counting as a failed attempt.
+- **Crash recovery** — prompts and verdicts are per-round files (`round-N.*`),
+  and a vanished worker pane is detected and relaunched, counting as a failed
+  attempt.
 - **Bounded fix loops** — `maxAttempts` caps implement + fix rounds; reviewers
   are capped the same way.
 - **Safe integration** — merges are `--no-ff` into the base branch. Conflicts
@@ -122,8 +124,9 @@ src/types.ts                          # ticket/state/event types
 ## Notes and limitations (V1)
 
 - Workers use whatever provider/model the Dispatcher Pi is configured with.
-- A worker that commits nothing, exits non-zero, or leaves a dirty tree counts
-  as a failed attempt (strict; retry/fail per `maxAttempts`).
+- An implementer that does not report a valid new commit id from its round, or
+  leaves a dirty tree, counts as a failed attempt (strict; retry/fail per
+  `maxAttempts`).
 - The state directory is added to the target repo's `.gitignore` on `start`.
 - `waiting_human` is now reserved for genuinely unresolvable situations:
   repeated merge conflicts, a worker that keeps stalling idle, or a worker
@@ -143,6 +146,6 @@ version automatically:
   the same interactive worker.
 
 Either way the worker is a real interactive `pi`, so Herdr reports
-`working`/`idle` and the TUI is visible. Completion is always detected by the
-round marker + git verification; a worker that runs over 3 hours without
-completing pauses the run with `waiting_human`.
+`working`/`idle` and the TUI is visible. Herdr status determines when a round
+settles; reported commit verification or the reviewer verdict determines
+whether it succeeded.

@@ -53,8 +53,8 @@ ready tickets, launches new workers up to `maxParallel`, and waits up to
 | Event | Meaning | What to do |
 |---|---|---|
 | `worker_started` | A worker pane was launched (interactive pi, visible in Herdr with working/idle status) | keep advancing |
-| `worker_retrying` | A worker round failed verification (no commit / dirty tree / no verdict) and the same worker was told to fix it | keep advancing |
-| `implementation_ready` | Worker committed clean changes | keep advancing (review/integration follow) |
+| `worker_retrying` | A worker round failed verification (invalid/missing reported commit, dirty tree, or no verdict) and was told to retry | keep advancing |
+| `implementation_ready` | Worker reported a valid new commit and left a clean worktree | keep advancing (review/integration follow) |
 | `review_completed` | Reviewer verdict in | keep advancing |
 | `ticket_integrated` | Branch merged into base, dependents unlocked | keep advancing |
 | `ticket_failed` | Ticket exhausted its attempts | note it; other tickets continue |
@@ -93,27 +93,28 @@ ticket_dispatch action=cleanup targetRepo=<path> removeIntegrated=true
 ```
 
 `cleanup` closes worker panes, removes worktrees and branches, and deletes
-worker logs. Failed-ticket worktrees are kept by default (`removeFailed=false`)
+worker prompt/verdict artifacts. Failed-ticket worktrees are kept by default (`removeFailed=false`)
 so a human can inspect them; pass `removeFailed=true` to remove them too, and
 `removeState=true` to delete the run's state directory entirely.
 
 Then report to the user: which tickets were integrated, which failed (and
-why), and where the run's logs live (`<repo>/.pi-ticket-dispatcher/work/<id>/`).
+why), and where the run artifacts live (`<repo>/.pi-ticket-dispatcher/work/<id>/`).
 
 ## Resuming an interrupted run
 
 If the Dispatcher Pi restarted mid-run:
 
 1. `ticket_dispatch action=resume targetRepo=<path>` — loads state from disk.
-2. Loop `advance` as above. Interrupted workers are detected by the tool
-   (pane gone without an exit file → automatic relaunch, counting as an attempt).
+2. Loop `advance` as above. A vanished worker pane is detected by the tool and
+   automatically relaunched, counting as an attempt.
 
 ## Rules
 
 - Only `start` once. After that, `advance` is the only way forward.
-- Workers are interactive `pi` processes: you can watch them work (and their
-  Herdr working/idle status) in the Herdr UI. Each worker round is detected by
-  a unique completion marker (DONE-<ID>-<round>) the worker replies with.
+- Workers are interactive `pi` processes. Implementers invoke
+  `/skill:implement`; reviewers invoke `/skill:code-review`. Herdr's
+  `working` → `idle` transition ends the round. The implementer's reported
+  commit id or the reviewer's verdict is then verified by code.
 - Workers that are actively working are never timed out. A worker that sits
   idle for 30 minutes without completing is auto-restarted (twice); if it keeps
   stalling, the run pauses with `waiting_human`.
