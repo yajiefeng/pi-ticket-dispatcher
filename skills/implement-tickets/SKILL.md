@@ -60,7 +60,7 @@ ready tickets, launches new workers up to `maxParallel`, and waits up to
 | `ticket_failed` | Ticket exhausted its attempts | note it; other tickets continue |
 | `state_unchanged` | No state change within the wait window | keep advancing; workers are still running |
 | `conflict_resolved` | A merge/rebase conflict was auto-resolved | keep advancing |
-| `waiting_human` | Rare: repeated merge conflicts, a repeatedly stalling worker, or launch failure | stop and ask the user |
+| `waiting_human` | Rare: repeated merge conflicts or launch failure | stop and ask the user |
 | `run_completed` | All tickets terminal | proceed to step 4 |
 | `run_failed` | Catastrophic run failure | report and stop |
 
@@ -115,9 +115,9 @@ If the Dispatcher Pi restarted mid-run:
   `/skill:implement`; reviewers invoke `/skill:code-review`. Herdr's
   `working` → `idle` transition ends the round. The implementer's reported
   commit id or the reviewer's verdict is then verified by code.
-- Workers that are actively working are never timed out. A worker that sits
-  idle for 30 minutes without completing is auto-restarted (twice); if it keeps
-  stalling, the run pauses with `waiting_human`.
+- Elapsed idle/working time never causes a live worker to be closed, relaunched,
+  or charged an attempt. Automatic crash recovery requires the Herdr agent or
+  pane to disappear.
 - Merge/rebase conflicts are auto-resolved (rebase, then a conflict worker);
   `waiting_human` only appears for genuinely unresolvable situations.
 - Never launch workers yourself; `advance` handles parallelism and capacity.

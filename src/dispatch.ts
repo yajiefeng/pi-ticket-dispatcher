@@ -93,10 +93,6 @@ const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 1_000;
 /** Re-send a worker's instruction if it remains idle without a result this long. */
 const REINSTRUCT_INTERVAL_MS = 90_000;
-/** If a worker reports non-working for this long without a result, it is stalled: auto-restart it. */
-const IDLE_TIMEOUT_MS = 30 * 60_000;
-/** Auto-restarts per worker before pausing for a human. */
-const MAX_WORKER_RESTARTS = 2;
 /** Conflict-resolution attempts per ticket before pausing for a human. */
 const MAX_CONFLICT_ATTEMPTS = 2;
 /** Default instruction suffix for conflict-resolution rounds. */
@@ -315,7 +311,7 @@ function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps)
     }
 
     // Idle without a result may mean Pi was not ready when the command was
-    // sent. Re-send periodically, then restart after a prolonged stall.
+    // sent. Re-send periodically, but never kill a live worker based on age.
     const lastSent = worker.instructionSentAt ?? worker.startedAt;
     if (deps.now() - lastSent > REINSTRUCT_INTERVAL_MS) {
       instructWorker(
@@ -329,67 +325,7 @@ function reapWorkers(state: DispatchState, ctx: ReapContext, deps: ResolvedDeps)
       continue;
     }
 
-    const lastActive = worker.lastActiveAt ?? worker.startedAt;
-    if (deps.now() - lastActive > IDLE_TIMEOUT_MS) {
-      restartStalledWorker(state, ticket, worker, ctx, deps);
-    }
   }
-}
-
-/**
- * A worker that stayed non-working past IDLE_TIMEOUT_MS without completing is
- * stalled: close its pane and relaunch it (bounded by MAX_WORKER_RESTARTS and
- * maxAttempts). Only after repeated stalls do we pause for a human.
- */
-function restartStalledWorker(
-  state: DispatchState,
-  ticket: TicketState,
-  worker: WorkerInfo,
-  ctx: ReapContext,
-  deps: ResolvedDeps
-): void {
-  const id = ticket.ticket.id;
-  const stallCount = (ticket.stallCount ?? 0) + 1;
-  deps.herdr.closePane(worker.paneId);
-
-  if (stallCount <= MAX_WORKER_RESTARTS && ticket.attemptCount < ticket.maxAttempts) {
-    const updated = addAttempt(ticket, {
-      type: ticket.status === "reviewing" ? ("review" as const) : ticket.status === "fixing" ? ("fix" as const) : ("implement" as const),
-      startedAt: worker.startedAt,
-      endedAt: Date.now(),
-      outcome: "failure",
-      notes: `worker stalled idle for ${Math.round(IDLE_TIMEOUT_MS / 60_000)}min without completing; restarted (${stallCount}/${MAX_WORKER_RESTARTS})`,
-      workerName: worker.agentName,
-    });
-    const nextRound = updated.round + 1;
-    if (ticket.status === "reviewing") {
-      updated.reviewer = undefined; // launchWorkers relaunches
-    } else {
-      updated.implementer = undefined;
-    }
-    updated.stallCount = stallCount;
-    updated.round = nextRound;
-    state.tickets[id] = updated;
-    ctx.events.push({
-      type: "worker_retrying",
-      ticketId: id,
-      round: nextRound,
-      reason: `worker ${worker.agentName} stalled idle and was restarted (${stallCount}/${MAX_WORKER_RESTARTS})`,
-    });
-    ctx.changed = true;
-    return;
-  }
-
-  // Restarts exhausted: pause the run and ask the human.
-  state.runStatus = "waiting_human";
-  state.statusMessage = `worker ${worker.agentName} (ticket ${id}) stalled ${stallCount} times without completing`;
-  ctx.events.push({
-    type: "waiting_human",
-    reason: `worker ${worker.agentName} for ticket ${id} stalled idle repeatedly without completing; resolve with retry_launch (restart), fail_ticket, or cancel_run`,
-    ticketId: id,
-    options: ["retry_launch", "fail_ticket", "cancel_run"],
-  });
-  ctx.changed = true;
 }
 
 /** An implementer pane vanished mid-round: count it and relaunch (or fail). */
@@ -1041,7 +977,7 @@ async function launchWorkers(state: DispatchState, ctx: ReapContext, deps: Resol
     }
   }
 
-  // 2) Relaunch implementers whose worker was cleared (crash / stall) and
+  // 2) Relaunch implementers whose worker was cleared after a crash and
   //    launch conflict-resolution workers for tickets waiting on a rebase.
   for (const id of activeTicketsToProcess(state, ctx.only)) {
     if (capacity <= 0) return;

@@ -94,8 +94,6 @@ export interface TicketState {
   errorMessage?: string;
   /** How many merge-conflict resolution attempts have been made (bounded). */
   conflictAttempts?: number;
-  /** How many consecutive idle-stalls this ticket's worker has had (auto-restarts). */
-  stallCount?: number;
   updatedAt: number;
   createdAt: number;
 }

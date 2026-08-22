@@ -509,41 +509,26 @@ test("merge conflict is auto-resolved by a conflict worker, then integrated", as
   assert.equal(merged, "merged\n");
 });
 
-test("stalled idle worker is auto-restarted, then pauses for a human", async () => {
+test("an old lastActiveAt never causes an idle worker to be killed or retried", async () => {
   const repo = makeGitRepo();
   const herdr = new FakeHerdr();
   await run({ action: "start", targetRepo: repo, ticketsSource: JSON.stringify([{ id: "X", title: "X", description: "", dependsOn: [] }]), maxAttempts: 5 }, herdr);
   await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
 
-  // Worker never completes and stays idle: fake the idle-stall signal by
-  // making the recorded last active time old.
   const statePath = path.join(repo, ".pi-ticket-dispatcher", "state.json");
-  const age = (ms: number) => {
-    const st = JSON.parse(fs.readFileSync(statePath, "utf-8"));
-    st.tickets.X.implementer.lastActiveAt = Date.now() - ms;
-    st.tickets.X.implementer.status = "starting";
-    const pane = herdr.panes.get(st.tickets.X.implementer.paneId);
-    if (pane) herdr.statuses.set(pane.name, "idle");
-    fs.writeFileSync(statePath, JSON.stringify(st), "utf-8");
-  };
+  const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  const paneId = state.tickets.X.implementer.paneId;
+  state.tickets.X.implementer.lastActiveAt = Date.now() - 24 * 60 * 60_000;
+  state.tickets.X.implementer.status = "starting";
+  herdr.statuses.set(herdr.panes.get(paneId)!.name, "idle");
+  fs.writeFileSync(statePath, JSON.stringify(state), "utf-8");
 
-  // First stall -> auto restart (worker_retrying), new worker launched.
-  age(40 * 60_000);
-  let r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
-  assert.ok(eventTypes(r).includes("worker_retrying"), JSON.stringify(r.events));
-  assert.equal(herdr.panes.size, 1, "a fresh worker pane should be launched");
-  assert.equal(r.tickets[0].attempts, 1);
+  const result = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
 
-  // Second stall -> restart again.
-  age(40 * 60_000);
-  r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
-  assert.ok(eventTypes(r).includes("worker_retrying"));
-
-  // Third stall (restarts exhausted) -> waiting_human.
-  age(40 * 60_000);
-  r = await run({ action: "advance", targetRepo: repo, waitMs: 0 }, herdr);
-  assert.ok(eventTypes(r).includes("waiting_human"), JSON.stringify(r.events));
-  assert.equal(r.runStatus, "waiting_human");
+  assert.deepEqual(eventTypes(result), ["state_unchanged"]);
+  assert.equal(result.runStatus, "running");
+  assert.equal(result.tickets[0].attempts, 0);
+  assert.equal(herdr.panes.has(paneId), true);
 });
 
 test("resume migrates legacy (pre-interactive) state", async () => {

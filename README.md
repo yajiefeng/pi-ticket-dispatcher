@@ -97,9 +97,9 @@ for the worker Pi processes.
   are auto-resolved: the ticket branch is rebased onto the base, and a worker
   resolves any remaining rebase conflicts; only after repeated failures does
   the run pause with `waiting_human`.
-- **Stall detection** — a worker that is actively working is never timed out;
-  a worker that sits idle without completing for 30 minutes is auto-restarted
-  (twice), then the run pauses with `waiting_human`.
+- **No age-based worker killing** — elapsed idle/working time never causes a
+  live worker to be closed, relaunched, or charged an attempt. Automatic crash
+  recovery requires the Herdr agent or pane to disappear.
 
 ## Development
 
@@ -131,9 +131,8 @@ src/types.ts                          # ticket/state/event types
   leaves a dirty tree, counts as a failed attempt (strict; retry/fail per
   `maxAttempts`).
 - The state directory is added to the target repo's `.gitignore` on `start`.
-- `waiting_human` is now reserved for genuinely unresolvable situations:
-  repeated merge conflicts, a worker that keeps stalling idle, or a worker
-  that fails to launch.
+- `waiting_human` is reserved for genuinely unresolvable situations such as
+  repeated merge conflicts or a worker that fails to launch.
 
 ## Herdr version compatibility
 
